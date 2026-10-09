@@ -46,7 +46,7 @@ def save(fig, name, out):
     plt.close(fig)
 
 
-def fig_anchor_error(S, model, out, layer):
+def fig_anchor_error(S, model, out, layer, suffix=""):
     D = S["layers"][layer]
     a, m = D["alpha"].flatten(), D["mass"].flatten()
     T = D["alpha"].shape[1]
@@ -82,7 +82,7 @@ def fig_anchor_error(S, model, out, layer):
         style(ax)
     axes[0].set_ylabel("per-token logit error", fontsize=8.5, color=INK2)
     fig.suptitle(f"{model}, layer {layer}: each anchor fails where α_t is far from it", fontsize=10.5, color=INK, y=1.02)
-    save(fig, "fig_anchor_error", out)
+    save(fig, "fig_anchor_error" + suffix, out)
 
 
 def attn_weighted(S, v, layers):
@@ -114,7 +114,7 @@ def fig_synergy_bars(SS, out):
     save(fig, "fig_synergy_bars", out)
 
 
-def fig_token_groups(S, model, out):
+def fig_token_groups(S, model, out, suffix=""):
     groups = ("first token", "mid-seq. sinks\n(α < 0.5)", "partial\n(|α−1| ≥ 0.2)", "ordinary\n(|α−1| < 0.2)")
     tok_share = {g: [] for g in groups}
     att_share = {g: [] for g in groups}
@@ -160,7 +160,7 @@ def fig_token_groups(S, model, out):
     a2.legend(frameon=False, fontsize=7.5, loc="upper right")
     style(a2)
     fig.suptitle(model, fontsize=10.5, color=INK, y=1.02)
-    save(fig, "fig_token_groups", out)
+    save(fig, "fig_token_groups" + suffix, out)
 
 
 def fig_ppl_grid(out):
@@ -208,10 +208,10 @@ def main():
         f = os.path.join(ROOT, tag, f"synergy_{args.data}.pt")
         if os.path.exists(f):
             SS[NAMES.get(tag, tag)] = torch.load(f)
-    first_model, S0 = next(iter(SS.items()))
-    fig_anchor_error(S0, first_model, out, args.layer)
+    for tag, (model, S) in zip([t for t in args.tags.split(",") if NAMES.get(t, t) in SS], SS.items()):
+        fig_anchor_error(S, model, out, args.layer, "_" + tag)
+        fig_token_groups(S, model, out, "_" + tag)
     fig_synergy_bars(SS, out)
-    fig_token_groups(S0, first_model, out)
     fig_ppl_grid(out)
     print("figures in", out)
 
