@@ -73,6 +73,43 @@ def build_chat(tok, prompt, model_name):
     return prompt, True
 
 
+def encode(tok, prompt, task, args):
+    """Token ids exactly as pred.py builds them: middle truncation, then the chat format."""
+    ids = tok(prompt, truncation=False).input_ids
+    if len(ids) > args.max_length:
+        half = args.max_length // 2
+        prompt = tok.decode(ids[:half], skip_special_tokens=True) + tok.decode(ids[-half:], skip_special_tokens=True)
+    add_special = True
+    if task not in NO_CHAT:
+        prompt, add_special = build_chat(tok, prompt, args.model)
+    return tok(prompt, truncation=False, add_special_tokens=add_special).input_ids
+
+
+def generate(model, tok, seqs, task, max_new, nl_id, device):
+    """Greedy decoding of a left-padded batch; latent projections learn each row's start
+    so the first-token exemption lands on the real first tokens."""
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    T = max(len(s) for s in seqs)
+    ids = torch.full((len(seqs), T), pad, dtype=torch.long)
+    mask = torch.zeros(len(seqs), T, dtype=torch.long)
+    for r, s in enumerate(seqs):
+        ids[r, T - len(s):] = torch.tensor(s)
+        mask[r, T - len(s):] = 1
+    start = torch.tensor([T - len(s) for s in seqs])
+    projs = [m for m in model.modules() if hasattr(m, "keep_first")]
+    for m in projs:
+        m.row_start = start
+    kw = dict(max_new_tokens=max_new, num_beams=1, do_sample=False, pad_token_id=pad)
+    if task == "samsum":
+        eos = model.generation_config.eos_token_id
+        eos = eos if isinstance(eos, list) else [eos]
+        kw.update(min_length=T + 1, eos_token_id=eos + [nl_id])
+    out = model.generate(input_ids=ids.to(device), attention_mask=mask.to(device), **kw)
+    for m in projs:
+        m.row_start = None
+    return [dict(pred=tok.decode(o[T:], skip_special_tokens=True), ctx_tokens=len(s)) for o, s in zip(out, seqs)]
+
+
 def score(task, preds, metrics):
     fn = getattr(metrics, METRIC[task])
     tot = 0.0
@@ -109,6 +146,8 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="first N samples per task (0: all)")
     p.add_argument("--max-length", type=int, default=31500, help="prompt tokens after middle truncation")
     p.add_argument("--cache", default=os.path.join(os.path.dirname(__file__), "..", "results", "longbench_data"))
+    p.add_argument("--max-batch", type=int, default=32)
+    p.add_argument("--batch-tokens", type=int, default=160000, help="prompt + generated tokens per batch")
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args()
 
@@ -116,6 +155,7 @@ def main():
     root = os.path.join(os.path.dirname(__file__), "..", "results", args.tag)
     out_root = os.path.join(root, "longbench" + (f"_n{args.limit}" if args.limit else ""))
     tok = AutoTokenizer.from_pretrained(args.model)
+    tok.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map=args.device,
                                                  attn_implementation="sdpa").eval()
     cfg = model.config
@@ -134,32 +174,25 @@ def main():
             data = [json.loads(l) for l in open(os.path.join(args.cache, "data", f"{task}.jsonl"))]
             data = data[:args.limit] if args.limit else data
             path = os.path.join(mdir, f"{task}.jsonl")
-            done = [json.loads(l) for l in open(path)] if os.path.exists(path) else []
+            done = {}
+            if os.path.exists(path):
+                for j, l in enumerate(open(path)):
+                    r = json.loads(l)
+                    done[r.get("idx", j)] = r
             t0 = time.time()
-            for obj in data[len(done):]:
-                prompt = prompts[task].format(**obj)
-                ids = tok(prompt, truncation=False).input_ids
-                if len(ids) > args.max_length:
-                    half = args.max_length // 2
-                    prompt = tok.decode(ids[:half], skip_special_tokens=True) + \
-                        tok.decode(ids[-half:], skip_special_tokens=True)
-                add_special = True
-                if task not in NO_CHAT:
-                    prompt, add_special = build_chat(tok, prompt, args.model)
-                enc = tok(prompt, truncation=False, return_tensors="pt", add_special_tokens=add_special).to(args.device)
-                ctx = enc.input_ids.shape[-1]
-                kw = dict(max_new_tokens=maxlen[task], num_beams=1, do_sample=False)
-                if task == "samsum":
-                    eos = model.generation_config.eos_token_id
-                    eos = eos if isinstance(eos, list) else [eos]
-                    kw.update(min_length=ctx + 1, eos_token_id=eos + [nl_id])
-                out = model.generate(**enc, **kw)[0]
-                pred = tok.decode(out[ctx:], skip_special_tokens=True)
-                rec = dict(pred=pred, answers=obj["answers"], all_classes=obj["all_classes"],
-                           length=obj["length"], ctx_tokens=ctx)
-                done.append(rec)
-                with open(path, "a") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            enc = {i: encode(tok, prompts[task].format(**obj), task, args) for i, obj in enumerate(data) if i not in done}
+            todo = sorted(enc, key=lambda i: -len(enc[i]))
+            while todo:
+                n = max(1, min(args.max_batch, args.batch_tokens // (len(enc[todo[0]]) + maxlen[task])))
+                batch, todo = todo[:n], todo[n:]
+                for i, rec in zip(batch, generate(model, tok, [enc[i] for i in batch], task, maxlen[task],
+                                                  nl_id, args.device)):
+                    obj = data[i]
+                    rec.update(idx=i, answers=obj["answers"], all_classes=obj["all_classes"], length=obj["length"])
+                    done[i] = rec
+                    with open(path, "a") as f:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            done = [done[i] for i in sorted(done)]
             res[task] = score(task, done, metrics)
             print(f"[{method}] {task:22s} {res[task]:6.2f}  (n={len(done)}, {time.time() - t0:.0f}s)", flush=True)
         res["avg"] = round(sum(res[t] for t in TASKS if t in res) / len([t for t in TASKS if t in res]), 2)

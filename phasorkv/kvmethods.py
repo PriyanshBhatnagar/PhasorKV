@@ -794,9 +794,18 @@ class LatentProj(torch.nn.Module):
                 alpha = (xf @ self.mu_scaled).to(torch.bfloat16).float()
                 out = out + alpha[..., None] * self.bias
         if self.keep_first and x.shape[1] > 1:
-            # prefill only: a decode step's single token is never among the first positions
-            n = min(self.keep_first, x.shape[1])
-            out[:, :n] = self.exact(x[:, :n]).float()
+            # prefill only: a decode step's single token is never among the first positions.
+            # row_start: left-padding per row (batched generation), so the exempt tokens are
+            # each sequence's own first ones
+            start = getattr(self, "row_start", None)
+            if start is None:
+                n = min(self.keep_first, x.shape[1])
+                out[:, :n] = self.exact(x[:, :n]).float()
+            else:
+                pos = torch.arange(x.shape[1], device=x.device)[None]
+                s = start.to(x.device)[:, None]
+                first = (pos >= s) & (pos < s + self.keep_first)
+                out[first] = self.exact(x[first]).float()
         if self.dyn_sink is not None:
             sink = (xf @ self.mu_scaled) < 0.5
             if self.keep_first:
