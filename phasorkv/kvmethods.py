@@ -73,6 +73,7 @@ TIERED = {   # kind: (K top, K rest, V top, V rest)
     "s42": ("i4t", "i2t", "i4t", "i2t"),
     "s32": ("i3t", "i2t", "i3t", "i2t"),
     "t22": ("nvint2", "nvint2", "i2t", "i2t"),
+    "t44": ("nvint4", "nvint4", "i4t", "i4t"),         # anchor class of the token hybrid
     # static per-channel scales: no per-token or per-group metadata at all
     "st43": ("s4", "s3", "s4", "s3"),
     "st42": ("s4", "s2", "s4", "s2"),
@@ -240,6 +241,11 @@ class LatentPatch:
         self.wq = False                       # K rebuild weights in NVFP4 (native FP4 x FP4 matmul)
         self.keep_first = 0                   # first tokens kept exact in bf16 (KVTC / AATC's sink rule)
         self.dyn_sink = False                 # also keep exact every token detected as a sink (alpha < 0.5)
+        self.hi_kind = None                   # token hybrid: anchors use this tier kind, the rest self.kind
+        self.anchor_frac = 0.0                #   share of each sequence's tokens that are anchors
+        self.sal_mode = "sq"                  #   anchor choice: sq mean-query alignment, sa sink-ness (-alpha), sr random
+        self.anchor_seen = [0, 0]
+        self.meanq = None                     #   {layer: [n_kv, d]} RoPE-averaged mean query (mean_query.py)
         self.keep_last = 0                    # recent window kept exact (KIVI / KVTC residual): the prompt's
                                               #   last tokens at prefill and every decoded token
         self.exempt_seen = [0, 0]             # [exempted, total] token-side counts for dyn_sink
@@ -267,6 +273,13 @@ class LatentPatch:
                     self.dyn_sink = True
                 if o.startswith("rw") and o[2:].isdigit():
                     self.keep_last = int(o[2:])
+                if o.startswith("hi") and o[2:].isdigit():
+                    self.hi_kind = "t" + o[2:]
+                    assert self.hi_kind in TIERED, self.hi_kind
+                if o.startswith("a") and o[1:].isdigit():
+                    self.anchor_frac = int(o[1:]) / 100
+                if o in ("sq", "sa", "sr"):
+                    self.sal_mode = o
                 if o == "r0":
                     self.krot = "none"
                 elif o.startswith("rg") and o[2:].isdigit():
@@ -304,8 +317,7 @@ class LatentPatch:
             noise = torch.tensor([f.split("|")[0] not in ("drop", "bf16") for f in menu])
             D[:, noise] = D[:, noise] * self.gamma
         if self.kind in TIERED and not self.fixed_rank:
-            kt, kr, vt, vr = TIERED[self.kind]
-            kd, vd = 0.2 * tier_bits(kt) + 0.8 * tier_bits(kr), 0.2 * tier_bits(vt) + 0.8 * tier_bits(vr)
+            kd, vd = self._tier_cost()
         else:
             kd = vd = 3.2
         per_dim = torch.tensor([3.2 if (self.kind in TIERED or self.kind.startswith(("diag", "dq-"))) and f == "bf16"
@@ -337,6 +349,18 @@ class LatentPatch:
             fV = [keep_f if j < nv else "drop" for j in range(len(fV))]
         return fK, fV
 
+    def _tier_cost(self):
+        """Bits per kept latent dim (K, V); a token hybrid pays the anchor/bulk blend."""
+        def cost(kind):
+            kt, kr, vt, vr = TIERED[kind]
+            return 0.2 * tier_bits(kt) + 0.8 * tier_bits(kr), 0.2 * tier_bits(vt) + 0.8 * tier_bits(vr)
+        kd, vd = cost(self.kind)
+        if self.hi_kind:
+            hk, hv = cost(self.hi_kind)
+            a = self.anchor_frac
+            kd, vd = (1 - a) * kd + a * hk, (1 - a) * vd + a * hv
+        return kd, vd
+
     def plan_global(self, tables, sens, n_kv, d):
         """Rank across all layers at once (the .gs variants).
 
@@ -348,9 +372,7 @@ class LatentPatch:
         total loss under an additive model. Layers then differ in rank and size."""
         assert self.kind in TIERED, "global allocation is implemented for the tiered kinds"
         drop = MENU_ALL.index("drop")
-        kt, kr, vt, vr = TIERED[self.kind]
-        kd = 0.2 * tier_bits(kt) + 0.8 * tier_bits(kr)
-        vd = 0.2 * tier_bits(vt) + 0.8 * tier_bits(vr)
+        kd, vd = self._tier_cost()
         overhead = sum(scale_overhead(self.kind, n_kv))
         pos = [v for l in sens for v in (sens[l]["k"], sens[l]["v"]) if v > 0]
         floor = 0.01 * sorted(pos)[len(pos) // 2]
@@ -471,6 +493,16 @@ class LatentPatch:
 
         self._var_k, self._var_v = torch.cat(var_k), vv
         kq, vq = self._quantizers(k_fmt, v_fmt, head_ranges, rv, v_no)
+        mask_fn = None
+        if self.hi_kind:
+            lo_kind, self.kind = self.kind, self.hi_kind
+            kq_hi, vq_hi = self._quantizers(k_fmt, v_fmt, head_ranges, rv, v_no)
+            self.kind = lo_kind
+            shared = {}
+            kq_lo, vq_lo = kq, vq
+            kq = lambda c, lengths: torch.where(shared["mask"][..., None], kq_hi(c, lengths), kq_lo(c, lengths))
+            vq = lambda c, lengths: torch.where(shared["mask"][..., None], vq_hi(c, lengths), vq_lo(c, lengths))
+            mask_fn = self._anchor_mask_fn(i, shared, prep, n_kv, d, n_q, device)
         old = (attn.k_proj, attn.v_proj)
         self._mean_mode = mm = prep.get("mean_mode", "alpha")
         mu = None if mm == "none" else prep["mu"].to(device)
@@ -478,6 +510,7 @@ class LatentPatch:
         extra = dict(center=mm == "center", keep_first=self.keep_first, keep_last=self.keep_last,
                      dyn_sink=self.exempt_seen if self.dyn_sink else None)
         attn.k_proj = LatentProj(Bk_all, Ak_all, kq, mu, kb, self.prune, self.prune_seen, exact=old[0], **extra)
+        attn.k_proj.token_mask_fn = mask_fn             # K runs before V: it sets the anchors both use
         attn.v_proj = LatentProj(Bv, Av, vq, mu, vb, self.prune, self.prune_seen, exact=old[1], **extra)
         windowed = self.prune > 0 and self.window > 0
         if windowed:
@@ -498,17 +531,56 @@ class LatentPatch:
                 del attn.forward
         return undo
 
+    def _anchor_mask_fn(self, i, shared, prep, n_kv, d, n_q, device):
+        """Write-time anchor choice for the token hybrid: the top anchor_frac of each sequence's
+        tokens by a saliency score (the first keep_first tokens, exact anyway, are never anchors)."""
+        mu = prep["mu"].to(device)
+        mus = mu / mu.dot(mu)
+        wq = None if self.sal_mode != "sq" else self.meanq[i].to(device)               # [n_kv, d]
+
+        def fn(xf, exact, lengths):
+            Bn, T, _ = xf.shape
+            valid = torch.ones(Bn, T, dtype=torch.bool, device=xf.device)
+            if lengths is not None:
+                valid = torch.arange(T, device=xf.device)[None] < lengths.to(xf.device)[:, None]
+            if self.sal_mode == "sq":
+                k = exact(xf.to(exact.weight.dtype)).float().view(Bn, T, n_kv, d)
+                s = torch.einsum("btgd,gd->btg", k, wq)
+                m = valid[..., None]
+                mean = (s * m).sum(1, keepdim=True) / m.sum(1, keepdim=True)
+                std = (((s - mean) ** 2) * m).sum(1, keepdim=True).div(m.sum(1, keepdim=True)).sqrt().clamp_min(1e-6)
+                score = ((s - mean) / std).mean(-1)
+            elif self.sal_mode == "sa":
+                score = -(xf @ mus)
+            else:
+                score = torch.rand(Bn, T, device=xf.device)
+            elig = valid.clone()
+            elig[:, :self.keep_first] = False
+            score = score.masked_fill(~elig, float("-inf"))
+            n_anchor = (self.anchor_frac * elig.sum(-1)).round().long()                   # per sequence
+            rank = torch.empty_like(score, dtype=torch.long)
+            rank.scatter_(-1, score.argsort(-1, descending=True), torch.arange(T, device=xf.device).expand(Bn, T))
+            shared["mask"] = (rank < n_anchor[:, None]) & elig
+            self.anchor_seen[0] += int(shared["mask"].sum())
+            self.anchor_seen[1] += int(elig.sum())
+        return fn
+
     def _bits(self, fmts, n_heads_kept, side="k", head_widths=None, head_tops=None):
         # + 8: half of the per-token bf16 alpha that K and V share
         a = 8 if self._mean_mode == "alpha" else 0
         if self.kind in TIERED:
-            kt, kr, vt, vr = TIERED[self.kind]
-            top, rest = (kt, kr) if side == "k" else (vt, vr)
-            tot = 0.0
-            for i, r in enumerate(head_widths):
-                no = head_tops[i] if head_tops is not None else int(STARQ_OUT * r)
-                tot += no * tier_bits(top) + (r - no) * tier_bits(rest)
-                tot += 16 * (top.endswith("t") and no > 0) + 16 * (rest.endswith("t") and r - no > 0)
+            def tiers(kind):
+                kt, kr, vt, vr = TIERED[kind]
+                top, rest = (kt, kr) if side == "k" else (vt, vr)
+                t = 0.0
+                for i, r in enumerate(head_widths):
+                    no = head_tops[i] if head_tops is not None else int(STARQ_OUT * r)
+                    t += no * tier_bits(top) + (r - no) * tier_bits(rest)
+                    t += 16 * (top.endswith("t") and no > 0) + 16 * (rest.endswith("t") and r - no > 0)
+                return t
+            tot = tiers(self.kind)
+            if self.hi_kind:
+                tot = (1 - self.anchor_frac) * tot + self.anchor_frac * tiers(self.hi_kind)
             if self.kind in TOKEN_SCALE:
                 per_head = side == "k" and TOKEN_SCALE[self.kind] == "head"
                 tot += 16 * (len(head_widths) if per_head else 1)
@@ -798,6 +870,8 @@ class LatentProj(torch.nn.Module):
         c = (xf - self.mu if self.center else xf) @ self.B.T
         if self.prune > 0 and self.mu_scaled is not None:
             c = self._prune(c, (xf @ self.mu_scaled).to(torch.bfloat16).float())
+        if getattr(self, "token_mask_fn", None) is not None:
+            self.token_mask_fn(xf, self.exact, self.lengths)        # anchors first: the quantizer needs them
         if self.quantize is not None:
             c = self.quantize(c, self.lengths)
         out = c @ self.A.T

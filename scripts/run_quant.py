@@ -38,6 +38,9 @@ def make_patch(name):
 def summarize(patch, n_layers, n_kv, d):
     st = patch.layer_stats
     out = dict(compression=compression(patch, n_layers, n_kv, d))
+    an = getattr(patch, "anchor_seen", None)
+    if getattr(patch, "hi_kind", None) and an and an[1]:
+        out["anchor_tokens"] = an[0] / an[1]
     ex = getattr(patch, "exempt_seen", None)
     if getattr(patch, "dyn_sink", False) and ex and ex[1]:
         out["exempt_tokens"] = ex[0] / ex[1]       # K and V side counts: same tokens, so a ratio
@@ -107,6 +110,8 @@ def main():
         for g in range(0, len(todo), group):
             patches = [make_patch(m) for m in todo[g:g + group]]
             for pch in patches:
+                if getattr(pch, "hi_kind", None) and pch.sal_mode == "sq":
+                    pch.meanq = torch.load(os.path.join(root, "meanq.pt"))
                 if getattr(pch, "global_sens", False):
                     pch.plan_global(*global_inputs(), n_kv, d)
             t0 = time.time()
