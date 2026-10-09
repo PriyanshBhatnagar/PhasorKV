@@ -749,6 +749,9 @@ class LatentProj(torch.nn.Module):
         # ablation bases: center = fixed mean (c = B (x - mu), out = A c + W mu, alpha = 1 for
         # every token); keep_first = that many leading tokens bypass the latent (exact projection)
         self.mu, self.center, self.exact, self.keep_first = mu, center, exact, keep_first
+        # projection bias (Qwen2's q/k/v): a per-output constant, added back exactly; the bases
+        # factor the weight alone
+        self.out_bias = None if exact is None or getattr(exact, "bias", None) is None else exact.bias.detach().float()
         # dyn_sink: counter list; tokens with alpha < 0.5 (sinks, wherever they are) bypass the
         # latent, as outlier-token tracing keeps detected sinks in full precision
         self.dyn_sink = dyn_sink
@@ -800,6 +803,8 @@ class LatentProj(torch.nn.Module):
             else:
                 alpha = (xf @ self.mu_scaled).to(torch.bfloat16).float()
                 out = out + alpha[..., None] * self.bias
+        if self.out_bias is not None:
+            out = out + self.out_bias
         if self.keep_first and x.shape[1] > 1:
             # prefill only: a decode step's single token is never among the first positions.
             # row_start: left-padding per row (batched generation), so the exempt tokens are

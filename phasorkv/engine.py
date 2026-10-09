@@ -17,7 +17,6 @@ def load(model_name: str, dtype=torch.bfloat16):
         model_name, dtype=dtype, device_map="cpu", attn_implementation="sdpa")
     model.eval()
     cfg = model.config
-    assert not getattr(cfg, "attention_bias", False), "k_proj bias is not handled"
     return model, tok
 
 
