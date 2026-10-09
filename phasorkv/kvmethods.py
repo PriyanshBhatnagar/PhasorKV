@@ -236,6 +236,8 @@ class LatentPatch:
         self.wq = False                       # K rebuild weights in NVFP4 (native FP4 x FP4 matmul)
         self.keep_first = 0                   # first tokens kept exact in bf16 (KVTC / AATC's sink rule)
         self.dyn_sink = False                 # also keep exact every token detected as a sink (alpha < 0.5)
+        self.keep_last = 0                    # recent window kept exact (KIVI / KVTC residual): the prompt's
+                                              #   last tokens at prefill and every decoded token
         self.exempt_seen = [0, 0]             # [exempted, total] token-side counts for dyn_sink
         self._mean_mode = "alpha"             # from the prep: alpha / center / none (ablation bases)
         self.prune_seen = [0, 0]              # [pruned, eligible-or-not total] token-side counts
@@ -259,6 +261,8 @@ class LatentPatch:
                     self.keep_first = int(o[4:])
                 if o == "dsink":
                     self.dyn_sink = True
+                if o.startswith("rw") and o[2:].isdigit():
+                    self.keep_last = int(o[2:])
                 if o == "r0":
                     self.krot = "none"
                 elif o.startswith("rg") and o[2:].isdigit():
@@ -467,7 +471,7 @@ class LatentPatch:
         self._mean_mode = mm = prep.get("mean_mode", "alpha")
         mu = None if mm == "none" else prep["mu"].to(device)
         kb, vb = (None, None) if mm == "none" else (prep["kbar"].to(device), prep["vbar"].to(device))
-        extra = dict(center=mm == "center", keep_first=self.keep_first,
+        extra = dict(center=mm == "center", keep_first=self.keep_first, keep_last=self.keep_last,
                      dyn_sink=self.exempt_seen if self.dyn_sink else None)
         attn.k_proj = LatentProj(Bk_all, Ak_all, kq, mu, kb, self.prune, self.prune_seen, exact=old[0], **extra)
         attn.v_proj = LatentProj(Bv, Av, vq, mu, vb, self.prune, self.prune_seen, exact=old[1], **extra)
@@ -736,7 +740,7 @@ class LatentProj(torch.nn.Module):
     quantile here (a deployment would calibrate it per layer offline)."""
 
     def __init__(self, B, A, quantize, mu=None, bias=None, prune=0.0, seen=None,
-                 center=False, exact=None, keep_first=0, dyn_sink=None):
+                 center=False, exact=None, keep_first=0, dyn_sink=None, keep_last=0):
         super().__init__()
         self.B, self.A, self.quantize, self.bias = B, A, quantize, bias
         self.mu_scaled = None if mu is None else mu / mu.dot(mu)
@@ -748,6 +752,9 @@ class LatentProj(torch.nn.Module):
         # dyn_sink: counter list; tokens with alpha < 0.5 (sinks, wherever they are) bypass the
         # latent, as outlier-token tracing keeps detected sinks in full precision
         self.dyn_sink = dyn_sink
+        # keep_last: a recent window held exact. At prefill the prompt's last tokens; at decode the new
+        # token (exact while it is in the window: right for generations no longer than the window)
+        self.keep_last = keep_last
 
     def _prune(self, c, alpha):
         Bn, T, _ = c.shape
@@ -806,6 +813,9 @@ class LatentProj(torch.nn.Module):
                 s = start.to(x.device)[:, None]
                 first = (pos >= s) & (pos < s + self.keep_first)
                 out[first] = self.exact(x[first]).float()
+        if self.keep_last:
+            n = min(self.keep_last, x.shape[1])
+            out[:, -n:] = self.exact(x[:, -n:]).float()
         if self.dyn_sink is not None:
             sink = (xf @ self.mu_scaled) < 0.5
             if self.keep_first:
