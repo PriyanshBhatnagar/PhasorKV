@@ -22,6 +22,7 @@ def main():
     p.add_argument("--tag", required=True)
     p.add_argument("--methods", default="", help="rows, in order (default: every method directory)")
     p.add_argument("--dir", default="longbench")
+    p.add_argument("--limit", type=int, default=0, help="runs made with --limit N: a task is complete at N samples")
     args = p.parse_args()
     cache = os.path.join(ROOT, "longbench_data")
     _, _, metrics = longbench_files(cache)
@@ -29,6 +30,8 @@ def main():
     methods = [m.replace(":", "__") for m in args.methods.split(",") if m] or sorted(os.listdir(base))
     methods = [m for m in methods if os.path.isdir(os.path.join(base, m))]
     n_exp = {t: sum(1 for _ in open(os.path.join(cache, "data", f"{t}.jsonl"))) for t in TASKS}
+    if args.limit:
+        n_exp = {t: min(n, args.limit) for t, n in n_exp.items()}
     table = {}
     for m in methods:
         row = {}
