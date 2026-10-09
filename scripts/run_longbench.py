@@ -15,6 +15,7 @@ Methods: bf16, or <basis variant>:<method>, e.g. diag-wo-alpha:starq.sink4@0.85
       --methods bf16,diag-wo-alpha:starq.sink4@0.85 --limit 50
 """
 import argparse
+import fcntl
 import importlib.util
 import json
 import os
@@ -195,15 +196,19 @@ def main():
             done = [done[i] for i in sorted(done)]
             res[task] = score(task, done, metrics)
             print(f"[{method}] {task:22s} {res[task]:6.2f}  (n={len(done)}, {time.time() - t0:.0f}s)", flush=True)
-        res["avg"] = round(sum(res[t] for t in TASKS if t in res) / len([t for t in TASKS if t in res]), 2)
-        for g, ts in GROUP.items():
-            if all(t in res for t in ts):
-                res[g] = round(sum(res[t] for t in ts) / len(ts), 2)
         if patch is not None:
             res["compression"] = compression(patch, cfg.num_hidden_layers, n_kv, d)
-        allres = json.load(open(scores_path)) if os.path.exists(scores_path) else {}
-        allres[method] = res
-        json.dump(allres, open(scores_path, "w"), indent=1)
+        # several runs (other tasks, other processes) share the file: merge under a lock
+        with open(scores_path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            allres = json.load(open(scores_path)) if os.path.exists(scores_path) else {}
+            res = {**allres.get(method, {}), **res}
+            res["avg"] = round(sum(res[t] for t in TASKS if t in res) / len([t for t in TASKS if t in res]), 2)
+            for g, ts in GROUP.items():
+                if all(t in res for t in ts):
+                    res[g] = round(sum(res[t] for t in ts) / len(ts), 2)
+            allres[method] = res
+            json.dump(allres, open(scores_path, "w"), indent=1)
         print(f"[{method}] avg {res['avg']:.2f}  " + "  ".join(f"{g}={res[g]:.2f}" for g in GROUP if g in res), flush=True)
         undo()
         torch.cuda.empty_cache()
