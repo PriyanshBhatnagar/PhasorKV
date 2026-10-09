@@ -69,6 +69,9 @@ TIERED = {   # kind: (K top, K rest, V top, V rest)
     "t42": ("nvint4", "nvint2", "i4t", "i2t"),
     "tqF": ("nvfp4", "nvint2", "i4t", "i2t"),          # native-FP4 4/2 (INT2 levels are FP4 values)
     "t32": ("nvint3", "nvint2", "i3t", "i2t"),         # 2.2 bits per kept dim: lower bits, keep the rank
+    # STAR-KV-style tiers (per-token scales) for K too: cheaper scales than NV block-16
+    "s42": ("i4t", "i2t", "i4t", "i2t"),
+    "s32": ("i3t", "i2t", "i3t", "i2t"),
     "t22": ("nvint2", "nvint2", "i2t", "i2t"),
     # static per-channel scales: no per-token or per-group metadata at all
     "st43": ("s4", "s3", "s4", "s3"),
