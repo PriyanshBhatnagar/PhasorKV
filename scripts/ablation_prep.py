@@ -10,6 +10,8 @@ A variant is <K weighting>-<V weighting>-<mean handling>:
                 dist  distance-aware: M = sum_delta p(delta) R_delta^T Sigma_q R_delta with the
                       model's measured attention-distance profile p (attn_distance.py);
                       p = point mass at 0 gives full, uniform over a long range gives diag
+                dlog  distance-aware with a scale-free prior p(delta) ~ 1/(1+delta) over the
+                      profile's range: every octave of distance weighs the same, no calibration
   V weighting   wsvd, pca as above; wo = W_o Gram (ours, and KQ-SVD's V)
   mean          none    no centering, basis on the raw second moment
                 center  fixed mean: c = B (x - mu), k = A c + W mu (SAKI, KVTC)
@@ -36,7 +38,7 @@ from phasorkv.engine import load, head_dims, Layerwise, token_stream, random_win
 from phasorkv.factorize import kv_query_energy
 from phasorkv.kvmethods import MENU_ALL, UNIT
 
-K_W, V_W, MEANS = ("wsvd", "pca", "full", "diag", "dist"), ("wsvd", "pca", "wo"), ("none", "center", "alpha")
+K_W, V_W, MEANS = ("wsvd", "pca", "full", "diag", "dist", "dlog"), ("wsvd", "pca", "wo"), ("none", "center", "alpha")
 
 
 def dist_weight(S, prob, cos, sin):
@@ -101,7 +103,7 @@ def k_basis(Wk, C, kw, q2, Sq, n_kv, d, Md=None):
             Qh, Qih = torch.diag(sq), torch.diag(1 / sq)
         elif kw == "full":
             Qh, Qih = _psd_pow(Sq[g], 0.5), _psd_pow(Sq[g], -0.5)
-        elif kw == "dist":
+        elif kw in ("dist", "dlog"):
             Qh, Qih = _psd_pow(Md[g], 0.5), _psd_pow(Md[g], -0.5)
         else:
             Qh = Qih = torch.eye(d, dtype=Wk.dtype, device=Wk.device)
@@ -163,10 +165,10 @@ def main():
     n_q, n_kv, d = head_dims(model)
     run = Layerwise(model, args.device, batch=4)
     Sq_all = None
-    if any(kw in ("full", "dist") for kw, _, _ in variants):
+    if any(kw in ("full", "dist", "dlog") for kw, _, _ in variants):
         Sq_all = query_moments(model, run, tok, n_q, n_kv, d, os.path.join(root, "stats_q.pt"))
     adist = None
-    if any(kw == "dist" for kw, _, _ in variants):
+    if any(kw in ("dist", "dlog") for kw, _, _ in variants):
         adist = torch.load(os.path.join(root, "attn_dist.pt"))
         cs, sn = run.position_embeddings(adist["seqlen"], torch.float32)
         rope_cs, rope_sn = cs[0].double(), sn[0].double()
@@ -187,10 +189,13 @@ def main():
         P = torch.eye(mu.numel(), device=dev, dtype=torch.float64) - torch.outer(mh, mh)
         C_of = {"none": Cx, "center": Cx - torch.outer(mu, mu), "alpha": P @ Cx @ P}
         Sq = None if Sq_all is None else Sq_all[i].to(dev).double()
-        Md = None
+        Md = {}
         if adist is not None:
             pd = adist["layers"][i].to(dev).double()
-            Md = torch.stack([dist_weight(Sq[g], pd[g], rope_cs, rope_sn) for g in range(n_kv)])
+            Md["dist"] = torch.stack([dist_weight(Sq[g], pd[g], rope_cs, rope_sn) for g in range(n_kv)])
+            pl = 1.0 / (1.0 + torch.arange(adist["seqlen"], device=dev, dtype=torch.float64))
+            pl = pl / pl.sum()
+            Md["dlog"] = torch.stack([dist_weight(Sq[g], pl, rope_cs, rope_sn) for g in range(n_kv)])
         if Sq is not None and i == 0:
             # Sq and q2 come from the same calibration pass: their pair energies must agree
             hd = d // 2
@@ -205,7 +210,7 @@ def main():
                 if kw == "wsvd" else C
             Cv = (P if mm == "alpha" else torch.eye(Cx.shape[0], device=dev, dtype=torch.float64)) \
                 if vw == "wsvd" else C
-            BK, AK, eK = k_basis(Wk, Ck, kw, stats[i]["q2"].to(dev), Sq, n_kv, d, Md)
+            BK, AK, eK = k_basis(Wk, Ck, kw, stats[i]["q2"].to(dev), Sq, n_kv, d, Md.get(kw))
             BV, AV, eV = v_basis(Wv, Wo, Cv, vw, n_kv, d, n_q)
             if mm == "alpha":
                 BK, BV = BK @ P, BV @ P
