@@ -7,6 +7,9 @@ A variant is <K weighting>-<V weighting>-<mean handling>:
                 full  full pre-RoPE query second moment per kv head, pooled over its
                       query heads (KQ-SVD's objective; SAKI's per head)
                 diag  ours: query energy per RoPE pair, averaged over relative position
+                dist  distance-aware: M = sum_delta p(delta) R_delta^T Sigma_q R_delta with the
+                      model's measured attention-distance profile p (attn_distance.py);
+                      p = point mass at 0 gives full, uniform over a long range gives diag
   V weighting   wsvd, pca as above; wo = W_o Gram (ours, and KQ-SVD's V)
   mean          none    no centering, basis on the raw second moment
                 center  fixed mean: c = B (x - mu), k = A c + W mu (SAKI, KVTC)
@@ -33,7 +36,24 @@ from phasorkv.engine import load, head_dims, Layerwise, token_stream, random_win
 from phasorkv.factorize import kv_query_energy
 from phasorkv.kvmethods import MENU_ALL, UNIT
 
-K_W, V_W, MEANS = ("wsvd", "pca", "full", "diag"), ("wsvd", "pca", "wo"), ("none", "center", "alpha")
+K_W, V_W, MEANS = ("wsvd", "pca", "full", "diag", "dist"), ("wsvd", "pca", "wo"), ("none", "center", "alpha")
+
+
+def dist_weight(S, prob, cos, sin):
+    """E_delta[R_{-delta}^T S R_{-delta}] for HF rotate-half RoPE, delta ~ prob.
+
+    R = diag(c) + diag(s) J with J x = (-x2, x1); expanding the product and taking the
+    expectation entrywise needs only E[c c^T], E[c s^T], E[s c^T], E[s s^T] over delta."""
+    d = S.shape[0]
+    h = d // 2
+    J = torch.zeros(d, d, dtype=S.dtype, device=S.device)
+    J[:h, h:] = -torch.eye(h, dtype=S.dtype, device=S.device)
+    J[h:, :h] = torch.eye(h, dtype=S.dtype, device=S.device)
+    c, s = cos, -sin                                                   # rotation by -delta
+    w = prob[:, None]
+    Ecc, Ecs, Ess = c.T @ (w * c), c.T @ (w * s), s.T @ (w * s)
+    M = S * Ecc + (S * Ecs) @ J + J.T @ (S * Ecs.T) + J.T @ (S * Ess) @ J
+    return 0.5 * (M + M.T)
 
 
 def query_moments(model, run, tok, n_q, n_kv, d, path, windows=32, seqlen=2048):
@@ -69,7 +89,7 @@ def _eig_desc(G):
     return e.flip(-1).clamp_min(0), U.flip(-1)
 
 
-def k_basis(Wk, C, kw, q2, Sq, n_kv, d):
+def k_basis(Wk, C, kw, q2, Sq, n_kv, d, Md=None):
     """-> B [n_kv*d, D], A [n_kv, d, d], energy [n_kv, d] (sorted within head)."""
     B, A, E = [], [], []
     lam = kv_query_energy(q2.double(), n_kv)
@@ -81,6 +101,8 @@ def k_basis(Wk, C, kw, q2, Sq, n_kv, d):
             Qh, Qih = torch.diag(sq), torch.diag(1 / sq)
         elif kw == "full":
             Qh, Qih = _psd_pow(Sq[g], 0.5), _psd_pow(Sq[g], -0.5)
+        elif kw == "dist":
+            Qh, Qih = _psd_pow(Md[g], 0.5), _psd_pow(Md[g], -0.5)
         else:
             Qh = Qih = torch.eye(d, dtype=Wk.dtype, device=Wk.device)
         Mw = Qh @ M
@@ -141,8 +163,13 @@ def main():
     n_q, n_kv, d = head_dims(model)
     run = Layerwise(model, args.device, batch=4)
     Sq_all = None
-    if any(kw == "full" for kw, _, _ in variants):
+    if any(kw in ("full", "dist") for kw, _, _ in variants):
         Sq_all = query_moments(model, run, tok, n_q, n_kv, d, os.path.join(root, "stats_q.pt"))
+    adist = None
+    if any(kw == "dist" for kw, _, _ in variants):
+        adist = torch.load(os.path.join(root, "attn_dist.pt"))
+        cs, sn = run.position_embeddings(adist["seqlen"], torch.float32)
+        rope_cs, rope_sn = cs[0].double(), sn[0].double()
     for kw, vw, mm in variants:
         os.makedirs(os.path.join(root, f"latent_{kw}-{vw}-{mm}"), exist_ok=True)
     # the same calibration latents prep_latent.py measures its tables on
@@ -160,6 +187,10 @@ def main():
         P = torch.eye(mu.numel(), device=dev, dtype=torch.float64) - torch.outer(mh, mh)
         C_of = {"none": Cx, "center": Cx - torch.outer(mu, mu), "alpha": P @ Cx @ P}
         Sq = None if Sq_all is None else Sq_all[i].to(dev).double()
+        Md = None
+        if adist is not None:
+            pd = adist["layers"][i].to(dev).double()
+            Md = torch.stack([dist_weight(Sq[g], pd[g], rope_cs, rope_sn) for g in range(n_kv)])
         if Sq is not None and i == 0:
             # Sq and q2 come from the same calibration pass: their pair energies must agree
             hd = d // 2
@@ -174,7 +205,7 @@ def main():
                 if kw == "wsvd" else C
             Cv = (P if mm == "alpha" else torch.eye(Cx.shape[0], device=dev, dtype=torch.float64)) \
                 if vw == "wsvd" else C
-            BK, AK, eK = k_basis(Wk, Ck, kw, stats[i]["q2"].to(dev), Sq, n_kv, d)
+            BK, AK, eK = k_basis(Wk, Ck, kw, stats[i]["q2"].to(dev), Sq, n_kv, d, Md)
             BV, AV, eV = v_basis(Wv, Wo, Cv, vw, n_kv, d, n_q)
             if mm == "alpha":
                 BK, BV = BK @ P, BV @ P

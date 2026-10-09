@@ -15,6 +15,7 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import torch
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "results")
@@ -184,13 +185,19 @@ def fig_ppl_grid(out):
             ax.plot(xs, ys, ls=ls, color=INK2, lw=1.2, zorder=1)
             for x, mn, y in zip(xs, ("none", "center", "alpha"), ys):
                 ax.plot(x, y, mk, color=MEAN[mn][1], ms=8, mfc=MEAN[mn][1] if b == "diag" else "white", mew=1.8, zorder=2)
-            ax.text(2.12, ys[-1], BASIS[b], fontsize=7.5, color=INK, va="center")
+            for x, y in zip(xs, ys):
+                ax.annotate(f"{y:.2f}", (x, y), xytext=(9 if b == "diag" else -9, 0), textcoords="offset points",
+                            ha="left" if b == "diag" else "right", va="center", fontsize=7, color=INK2)
         ax.set_xticks(list(xs))
-        ax.set_xticklabels([MEAN[k][0] for k in ("none", "center", "alpha")], fontsize=7.5, color=INK, rotation=10)
-        ax.set_yscale("log")
-        ax.set_xlim(-0.3, 2.9)
+        ax.set_xticklabels(["no mean\nhandling", "fixed-mean\ncentering", "mean split\n(ours)"], fontsize=8, color=INK)
+        ax.set_xlim(-0.5, 2.5)
         ax.set_title(model, fontsize=10, color=INK)
         style(ax)
+    from matplotlib.lines import Line2D
+    fig.legend([Line2D([], [], color=INK2, ls="-", marker="o", mfc=INK2, ms=6),
+                Line2D([], [], color=INK2, ls="--", marker="s", mfc="white", ms=6)],
+               [BASIS["diag"], BASIS["pca"]], loc="upper center", ncol=2, frameon=False, fontsize=8.5,
+               bbox_to_anchor=(0.5, 1.07))
     axes[0][0].set_ylabel("WikiText-2 perplexity at 85%\n(first 4 tokens exact for all)", fontsize=8.5, color=INK2)
     save(fig, "fig_ppl_grid", out)
 
