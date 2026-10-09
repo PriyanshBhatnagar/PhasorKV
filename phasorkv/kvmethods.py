@@ -793,7 +793,8 @@ class LatentProj(torch.nn.Module):
             else:
                 alpha = (xf @ self.mu_scaled).to(torch.bfloat16).float()
                 out = out + alpha[..., None] * self.bias
-        if self.keep_first:
+        if self.keep_first and x.shape[1] > 1:
+            # prefill only: a decode step's single token is never among the first positions
             n = min(self.keep_first, x.shape[1])
             out[:, :n] = self.exact(x[:, :n]).float()
         if self.dyn_sink is not None:
