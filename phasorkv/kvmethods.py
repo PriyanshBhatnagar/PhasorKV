@@ -74,6 +74,11 @@ TIERED = {   # kind: (K top, K rest, V top, V rest)
     "s32": ("i3t", "i2t", "i3t", "i2t"),
     "t22": ("nvint2", "nvint2", "i2t", "i2t"),
     "t44": ("nvint4", "nvint4", "i4t", "i4t"),         # anchor class of the token hybrid
+    # block-16 NV scales for V too (along the latent channels, like K): the sorted spectrum makes
+    # adjacent channels similar in scale, which a per-16 scale (and per-16 Hadamard, .rg16) tracks
+    "t42n": ("nvint4", "nvint2", "nvint4", "nvint2"),
+    "t32n": ("nvint3", "nvint2", "nvint3", "nvint2"),
+    "t22n": ("nvint2", "nvint2", "nvint2", "nvint2"),
     # static per-channel scales: no per-token or per-group metadata at all
     "st43": ("s4", "s3", "s4", "s3"),
     "st42": ("s4", "s2", "s4", "s2"),
@@ -486,7 +491,13 @@ class LatentPatch:
             R = tier_rotation(v_fmt, torch.Generator().manual_seed(1234)).to(device)
             Bv, Av = R @ Bv, Av @ R.T
         if self.kind in TIER_H or getattr(self, "dq_rot", "") == "tierH":
-            R, v_no = starq_blocks(rv, torch.Generator().manual_seed(1234))
+            gv = torch.Generator().manual_seed(1234)
+            if self.krot == "tier":                      # V rotation follows the K choice
+                R, v_no = starq_blocks(rv, gv)
+            elif self.krot == "none":
+                R, v_no = torch.eye(rv, dtype=torch.float64), int(STARQ_OUT * rv)
+            else:
+                R, v_no = group_blocks(rv, self.krot, gv)
             R = R.float().to(device)
             Bv, Av = R @ Bv, Av @ R.T
             vv = (R * R) @ vv
