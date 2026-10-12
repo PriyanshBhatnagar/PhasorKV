@@ -102,7 +102,8 @@ def main():
                 t = torch.load(os.path.join(lat_dir, f"L{i}.pt"), mmap=True)
                 cache.setdefault("tables", {})[i] = {"DK": t["DK"].clone(), "DV": t["DV"].clone(),
                                                      "k_group": t.get("k_group", 1)}
-            sens = json.load(open(os.path.join(root, "layer_sens.json")))["layers"]
+            own = os.path.join(root, f"layer_sens_{args.latent}.json")       # probes on this basis, if made
+            sens = json.load(open(own if args.latent and os.path.exists(own) else os.path.join(root, "layer_sens.json")))["layers"]
             cache["sens"] = {int(l): v for l, v in sens.items()}
         return cache["tables"], cache["sens"]
 

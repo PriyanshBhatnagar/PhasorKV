@@ -33,12 +33,13 @@ def main():
     p.add_argument("--frac", type=float, default=0.9, help="probe strength: the reference's per-layer choice at this compression")
     p.add_argument("--windows", type=int, default=8)
     p.add_argument("--seqlen", type=int, default=2048)
+    p.add_argument("--latent", default="", help="basis variant (results/<tag>/latent_<variant>); default: latent/")
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args()
 
     root = os.path.join(os.path.dirname(__file__), "..", "results", args.tag)
     model, tok = load(args.model)
-    lat = os.path.join(root, "latent")
+    lat = os.path.join(root, f"latent_{args.latent}" if args.latent else "latent")
     runner = Runner(model, args.device, prep_loader=lambda i: torch.load(os.path.join(lat, f"L{i}.pt")))
     L = model.config.num_hidden_layers
     # calibration text, disjoint from the windows the bases were fitted on (seed 0/1)
@@ -53,7 +54,7 @@ def main():
         r[pr.side] = kl[pr.name] / max(pr.dropped, 1e-30)
         r[pr.side + "_kl"], r[pr.side + "_energy"] = kl[pr.name], pr.dropped
     json.dump(dict(ref=args.ref, frac=args.frac, metric="kl", layers=res),
-              open(os.path.join(root, "layer_sens.json"), "w"), indent=1)
+              open(os.path.join(root, f"layer_sens_{args.latent}.json" if args.latent else "layer_sens.json"), "w"), indent=1)
     print(f"probes done ({time.time() - t0:.0f}s)")
     for l in range(L):
         r = res[l]
