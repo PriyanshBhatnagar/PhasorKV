@@ -52,6 +52,9 @@ def summarize(patch, n_layers, n_kv, d):
         out["k_bits_share"] = sum(s["bits_k"] for s in st.values()) / sum(s["bits_k"] + s["bits_v"] for s in st.values())
         out["rank_k"] = sum(s["rank_k"] for s in st.values()) / len(st) / full
         out["rank_v"] = sum(s["rank_v"] for s in st.values()) / len(st) / full
+        if "k_rebuild_flops" in next(iter(st.values())):
+            # K rebuild FLOPs per token per layer, relative to scoring the uncompressed keys (2 n_kv d)
+            out["k_rebuild_x"] = sum(s["k_rebuild_flops"] for s in st.values()) / len(st) / (2 * full)
         fm = {}
         for s in st.values():
             for side in ("fmt_k", "fmt_v"):
@@ -97,7 +100,8 @@ def main():
         if not cache:
             for i in range(n_layers):
                 t = torch.load(os.path.join(lat_dir, f"L{i}.pt"), mmap=True)
-                cache.setdefault("tables", {})[i] = {"DK": t["DK"].clone(), "DV": t["DV"].clone()}
+                cache.setdefault("tables", {})[i] = {"DK": t["DK"].clone(), "DV": t["DV"].clone(),
+                                                     "k_group": t.get("k_group", 1)}
             sens = json.load(open(os.path.join(root, "layer_sens.json")))["layers"]
             cache["sens"] = {int(l): v for l, v in sens.items()}
         return cache["tables"], cache["sens"]

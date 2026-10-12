@@ -334,8 +334,9 @@ class LatentPatch:
             cost[:DK.shape[0], keep] = kd * UNIT
             cost[DK.shape[0]:, keep] = vd * UNIT
         budget = (1 - self.frac) * 16 * 2 * n_kv * d
+        gk = prep.get("k_group", 1)                     # K latent shared by gk kv heads (1: per head)
         if self.kind in TIERED:
-            budget -= sum(scale_overhead(self.kind, n_kv))
+            budget -= sum(scale_overhead(self.kind, n_kv // gk))
         elif self.kind.startswith(("diag", "dq-")):
             budget -= 32 * (n_kv + 1)        # two bf16 scales per head (K) and for V, per token
         ch = allocate(D, cost, budget)
@@ -345,11 +346,11 @@ class LatentPatch:
         if self.kind == "ours_H":
             fK = [f if f == "drop" else f + "|H" for f in fK]
         if self.kind in ("palu", "lr", "lrnv") or self.kind in TIERED or self.kind.startswith(("diag", "dq-")):
-            # rank-only selections: keep each head's (and V's) leading units
-            per = d // UNIT
-            kept = [sum(f != "drop" for f in fK[h * per:(h + 1) * per]) for h in range(n_kv)]
+            # rank-only selections: keep each K block's (and V's) leading units
+            per, nkb = gk * d // UNIT, n_kv // gk
+            kept = [sum(f != "drop" for f in fK[h * per:(h + 1) * per]) for h in range(nkb)]
             keep_f = menu[0]
-            fK = [keep_f if j < kept[h] else "drop" for h in range(n_kv) for j in range(per)]
+            fK = [keep_f if j < kept[h] else "drop" for h in range(nkb) for j in range(per)]
             nv = sum(f != "drop" for f in fV)
             fV = [keep_f if j < nv else "drop" for j in range(len(fV))]
         return fK, fV
@@ -378,7 +379,8 @@ class LatentPatch:
         assert self.kind in TIERED, "global allocation is implemented for the tiered kinds"
         drop = MENU_ALL.index("drop")
         kd, vd = self._tier_cost()
-        overhead = sum(scale_overhead(self.kind, n_kv))
+        gk = next(iter(tables.values())).get("k_group", 1)
+        overhead = sum(scale_overhead(self.kind, n_kv // gk))
         pos = [v for l in sens for v in (sens[l]["k"], sens[l]["v"]) if v > 0]
         floor = 0.01 * sorted(pos)[len(pos) // 2]
         vals, costs, owner, budget = [], [], [], 0.0
@@ -392,8 +394,8 @@ class LatentPatch:
         vals, costs = torch.cat(vals), torch.cat(costs)
         order = torch.argsort(vals / costs, descending=True)
         keep = order[torch.cumsum(costs[order], 0) <= budget].tolist()
-        per = d // UNIT
-        kept = {l: {"k": [0] * n_kv, "v": 0} for l in tables}
+        per, nkb = gk * d // UNIT, n_kv // gk
+        kept = {l: {"k": [0] * nkb, "v": 0} for l in tables}
         for idx in keep:
             l, side, u = owner[idx]
             if side == "k":
@@ -402,7 +404,7 @@ class LatentPatch:
                 kept[l]["v"] += 1
         self.plan = {}
         for l, tab in tables.items():
-            fK = ["bf16" if j < kept[l]["k"][h] else "drop" for h in range(n_kv) for j in range(per)]
+            fK = ["bf16" if j < kept[l]["k"][h] else "drop" for h in range(nkb) for j in range(per)]
             fV = ["bf16" if j < kept[l]["v"] else "drop" for j in range(tab["DV"].shape[0])]
             self.plan[l] = (fK, fV)
         return self.plan
@@ -413,19 +415,21 @@ class LatentPatch:
         attn = layer.self_attn
         per = d // UNIT
 
-        # K: latent columns of the kept units, head-major
+        # K: latent columns of the kept units, block-major (a block = gk kv heads sharing one latent)
+        gk = prep.get("k_group", 1)
+        dk, nkb, per = gk * d, n_kv // gk, gk * d // UNIT
         BK, AK = prep["BK"].to(device), prep["AK"].to(device)
-        rots = [R.to(device) for R in k_rotations(n_kv, d)]
+        rots = [R.to(device) for R in k_rotations(nkb, dk)]
         k_cols, k_fmt, B_rows, A_cols, var_k = [], [], [], [], []
         head_ranges, gen = [], torch.Generator().manual_seed(1234)
-        for h in range(n_kv):
-            Bh, Ah = BK[h * d:(h + 1) * d], AK[h]
+        for h in range(nkb):
+            Bh, Ah = BK[h * dk:(h + 1) * dk], AK[h]
             units = [j for j in range(per) if fK[h * per + j] != "drop"]
             if not units:
                 continue
             rot_units = [j for j in units if fK[h * per + j].endswith("|H")]
             if rot_units:
-                R = torch.eye(d, device=device)
+                R = torch.eye(dk, device=device)
                 for j in rot_units:
                     sl = slice(j * UNIT, (j + 1) * UNIT)
                     R[sl, sl] = rots[h][sl, sl]
@@ -467,7 +471,7 @@ class LatentPatch:
             else:
                 head_ranges.append((sum(len(c) for c in B_rows), 0, r))
             out = torch.zeros(n_kv * d, r, device=device)
-            out[h * d:(h + 1) * d] = Ak
+            out[h * dk:(h + 1) * dk] = Ak
             B_rows.append(Bk)
             A_cols.append(out)
             var_k.append(vk)
@@ -532,6 +536,7 @@ class LatentPatch:
                             [no for _, no, _ in head_ranges])
         bits_v = self._bits(v_fmt, 1, "v", [rv])
         self.layer_stats[i] = dict(bits_k=bits_k, bits_v=bits_v, rank_k=Bk_all.shape[0], rank_v=rv,
+                                   k_rebuild_flops=sum(2 * dk * r for _, _, r in head_ranges),
                                    rotated_k=sum(f.endswith("|H") for f in fK),
                                    fmt_k={f: k_fmt.count(f) for f in set(k_fmt)},
                                    fmt_v={f: v_fmt.count(f) for f in set(v_fmt)})

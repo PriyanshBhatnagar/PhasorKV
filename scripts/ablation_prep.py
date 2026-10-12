@@ -12,6 +12,10 @@ A variant is <K weighting>-<V weighting>-<mean handling>:
                       p = point mass at 0 gives full, uniform over a long range gives diag
                 dlog  distance-aware with a scale-free prior p(delta) ~ 1/(1+delta) over the
                       profile's range: every octave of distance weighs the same, no calibration
+                suffix j / gN (e.g. diagj, diagg4): one K latent shared by all kv heads / by groups
+                      of N heads. The weight stays block-diagonal (an error in head h's key only
+                      moves head h's scores), so the objective is still the sum of per-head score
+                      errors; rebuilding costs N x more FLOPs per kept dim
   V weighting   wsvd, pca as above; wo = W_o Gram (ours, and KQ-SVD's V)
   mean          none    no centering, basis on the raw second moment
                 center  fixed mean: c = B (x - mu), k = A c + W mu (SAKI, KVTC)
@@ -91,22 +95,41 @@ def _eig_desc(G):
     return e.flip(-1).clamp_min(0), U.flip(-1)
 
 
-def k_basis(Wk, C, kw, q2, Sq, n_kv, d, Md=None):
-    """-> B [n_kv*d, D], A [n_kv, d, d], energy [n_kv, d] (sorted within head)."""
+def k_split(kw, n_kv):
+    """'diagj' -> ('diag', n_kv); 'diagg4' -> ('diag', 4); 'diag' -> ('diag', 1)."""
+    for base in K_W:
+        if kw == base:
+            return base, 1
+        if kw == base + "j":
+            return base, n_kv
+        if kw.startswith(base + "g") and kw[len(base) + 1:].isdigit():
+            return base, int(kw[len(base) + 1:])
+    raise ValueError(kw)
+
+
+def k_basis(Wk, C, kw, q2, Sq, n_kv, d, Md=None, group=1):
+    """-> B [n_kv*d, D], A [n_kv/group, group*d, group*d], energy [n_kv/group, group*d]
+    (sorted within each block of `group` kv heads; group=1 is per head)."""
     B, A, E = [], [], []
     lam = kv_query_energy(q2.double(), n_kv)
     lam = lam.clamp_min(lam.max() * 1e-12)
-    for g in range(n_kv):
-        M = Wk[g * d:(g + 1) * d]
+
+    def head_weight(h):
         if kw == "diag":
-            sq = torch.cat([lam[g], lam[g]]).sqrt()
-            Qh, Qih = torch.diag(sq), torch.diag(1 / sq)
-        elif kw == "full":
-            Qh, Qih = _psd_pow(Sq[g], 0.5), _psd_pow(Sq[g], -0.5)
-        elif kw in ("dist", "dlog"):
-            Qh, Qih = _psd_pow(Md[g], 0.5), _psd_pow(Md[g], -0.5)
-        else:
-            Qh = Qih = torch.eye(d, dtype=Wk.dtype, device=Wk.device)
+            sq = torch.cat([lam[h], lam[h]]).sqrt()
+            return torch.diag(sq), torch.diag(1 / sq)
+        if kw == "full":
+            return _psd_pow(Sq[h], 0.5), _psd_pow(Sq[h], -0.5)
+        if kw in ("dist", "dlog"):
+            return _psd_pow(Md[h], 0.5), _psd_pow(Md[h], -0.5)
+        I = torch.eye(d, dtype=Wk.dtype, device=Wk.device)
+        return I, I
+
+    for g in range(n_kv // group):
+        heads = range(g * group, (g + 1) * group)
+        M = Wk[g * group * d:(g + 1) * group * d]
+        ws = [head_weight(h) for h in heads]
+        Qh, Qih = torch.block_diag(*[w[0] for w in ws]), torch.block_diag(*[w[1] for w in ws])
         Mw = Qh @ M
         e, U = _eig_desc(Mw @ C @ Mw.T)
         B.append(U.T @ Mw)
@@ -157,18 +180,19 @@ def main():
 
     variants = [v.split("-") for v in args.variants.split(",")]
     for kw, vw, mm in variants:
-        assert kw in K_W and vw in V_W and mm in MEANS, (kw, vw, mm)
+        assert vw in V_W and mm in MEANS, (kw, vw, mm)
     root = os.path.join(os.path.dirname(__file__), "..", "results", args.tag)
     stats = {s["layer"]: s for s in torch.load(os.path.join(root, "stats.pt"))["layers"]}
     dev = torch.device(args.device)
     model, tok = load(args.model)
     n_q, n_kv, d = head_dims(model)
     run = Layerwise(model, args.device, batch=4)
+    kspec = {kw: k_split(kw, n_kv) for kw, _, _ in variants}            # K weighting, heads per latent
     Sq_all = None
-    if any(kw in ("full", "dist", "dlog") for kw, _, _ in variants):
+    if any(kspec[kw][0] in ("full", "dist", "dlog") for kw, _, _ in variants):
         Sq_all = query_moments(model, run, tok, n_q, n_kv, d, os.path.join(root, "stats_q.pt"))
     adist = None
-    if any(kw in ("dist", "dlog") for kw, _, _ in variants):
+    if any(kspec[kw][0] in ("dist", "dlog") for kw, _, _ in variants):
         adist = torch.load(os.path.join(root, "attn_dist.pt"))
         cs, sn = run.position_embeddings(adist["seqlen"], torch.float32)
         rope_cs, rope_sn = cs[0].double(), sn[0].double()
@@ -205,18 +229,20 @@ def main():
             print(f"  check Sq vs q2: rel diff {((lam_sq - lam_q2).norm() / lam_q2.norm()).item():.1e}")
         msg = []
         for kw, vw, mm in variants:
+            kb, gk = kspec[kw]
             C = C_of[mm]
             Ck = (P if mm == "alpha" else torch.eye(Cx.shape[0], device=dev, dtype=torch.float64)) \
-                if kw == "wsvd" else C
+                if kb == "wsvd" else C
             Cv = (P if mm == "alpha" else torch.eye(Cx.shape[0], device=dev, dtype=torch.float64)) \
                 if vw == "wsvd" else C
-            BK, AK, eK = k_basis(Wk, Ck, kw, stats[i]["q2"].to(dev), Sq, n_kv, d, Md.get(kw))
+            BK, AK, eK = k_basis(Wk, Ck, kb, stats[i]["q2"].to(dev), Sq, n_kv, d, Md.get(kb), group=gk)
             BV, AV, eV = v_basis(Wv, Wo, Cv, vw, n_kv, d, n_q)
             if mm == "alpha":
                 BK, BV = BK @ P, BV @ P
             # exact at full rank in every variant (center: A B (x - mu) + W mu = W x needs A B = W)
             mean_part = (lambda W: torch.outer(W @ mu, mu) / mu.dot(mu)) if mm == "alpha" else (lambda W: 0)
-            WK_hat = torch.cat([AK[g] @ BK[g * d:(g + 1) * d] for g in range(n_kv)]) + mean_part(Wk)
+            gd = gk * d
+            WK_hat = torch.cat([AK[g] @ BK[g * gd:(g + 1) * gd] for g in range(n_kv // gk)]) + mean_part(Wk)
             ek = ((WK_hat - Wk).norm() / Wk.norm()).item()
             ev = ((AV @ BV + mean_part(Wv) - Wv).norm() / Wv.norm()).item()
             BK, AK, BV, AV = BK.float(), AK.float(), BV.float(), AV.float()
@@ -224,7 +250,7 @@ def main():
             cK = xin.reshape(-1, xin.shape[-1]) @ BK.T
             cV = xin @ BV.T
             DK, DV = drop_table(cK, -1), drop_table(cV, 1)
-            torch.save(dict(mean_mode=mm, mu=mu.float().cpu(), kbar=(Wk @ mu).float().cpu(),
+            torch.save(dict(mean_mode=mm, k_group=gk, mu=mu.float().cpu(), kbar=(Wk @ mu).float().cpu(),
                             vbar=(Wv @ mu).float().cpu(), BK=BK.cpu(), AK=AK.cpu(), eK=eK.float().cpu(),
                             BV=BV.cpu(), AV=AV.cpu(), eV=eV.float().cpu(), DK=DK.cpu(), DK_H=DK.cpu(),
                             DV=DV.cpu(), menu=MENU_ALL),
