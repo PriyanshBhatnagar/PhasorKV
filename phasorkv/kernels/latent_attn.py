@@ -71,16 +71,25 @@ class LayerPack:
         A[..., :self.v_no] = self.A_v[..., :self.v_no]
         A[..., 2 * nb_t:2 * nb_t + self.rv - self.v_no] = self.A_v[..., self.v_no:]
         self.A_v_pad = A.to(torch.bfloat16).contiguous()
+        # "q2" layout (the fused path): top tier in nibbles (nb bytes), rest tier at 2 bits (nq bytes,
+        # byte j = columns j, nq + j, 2 nq + j, 3 nq + j); z columns [top: 2 nb][rest: 4 nq]
+        q_t, q_r = 8 * math.ceil(self.v_no / 16), 8 * math.ceil((self.rv - self.v_no) / 32)
+        self.q2_nb = (q_t, q_r)
+        self.q2_row = 16 * math.ceil((q_t + q_r) / 16)
+        self.q2_zw = 2 * q_t + 4 * q_r
+        A = torch.zeros(self.n_kv, self.d, self.q2_zw, device=self.A_v.device)
+        A[..., :self.v_no] = self.A_v[..., :self.v_no]
+        A[..., 2 * q_t:2 * q_t + self.rv - self.v_no] = self.A_v[..., self.v_no:]
+        self.A_v_q2 = A.to(torch.bfloat16).contiguous()
 
     @property
     def k_rebuild_flops(self):
         """Per token: 2 * d * rank summed over kv heads (the FP4 MMA work)."""
         return int(2 * self.d * self.head_i[:, 1].sum())
 
-    def bytes_per_token(self):
-        """Cache bytes per token, 4-bit codes (this kernel's storage): K codes + block scales,
-        V codes + two bf16 scales, alpha."""
-        return self.rk // 2 + self.rk // 16 + self.v_row + 4 + 2
+    def bytes_per_token(self, v_layout="nib"):
+        """Cache bytes per token: K codes (4-bit) + block scales, V codes + two bf16 scales, alpha."""
+        return self.rk // 2 + self.rk // 16 + (self.q2_row if v_layout == "q2" else self.v_row) + 4 + 2
 
     def bytes_per_token_packed(self):
         """Same with NVINT3 / NVINT2 packed to 3 / 2 bits."""
@@ -219,7 +228,30 @@ def unpack_v_codes(pack: LayerPack, vc):
     return torch.cat(out, -1)
 
 
-def write(pack: LayerPack, x: torch.Tensor):
+def pack_v_q2(pack: LayerPack, codes):
+    """E2M1 codes [..., rv] (top: 3-bit levels, rest: +-0.5 / +-1.5) -> q2 bytes [..., q2_row]."""
+    q_t, q_r = pack.q2_nb
+    top = torch.nn.functional.pad(codes[..., :pack.v_no], (0, 2 * q_t - pack.v_no))
+    top = top[..., :q_t] | (top[..., q_t:] << 4)
+    r = codes[..., pack.v_no:]
+    f = ((r >> 3) << 1) | ((r >> 1) & 1)                        # 2-bit field: sign | magnitude
+    f = torch.nn.functional.pad(f, (0, 4 * q_r - f.shape[-1]))
+    rest = f[..., :q_r] | (f[..., q_r:2 * q_r] << 2) | (f[..., 2 * q_r:3 * q_r] << 4) | (f[..., 3 * q_r:] << 6)
+    v = torch.cat([top, rest], -1)
+    return torch.nn.functional.pad(v, (0, pack.q2_row - v.shape[-1])).to(torch.uint8)
+
+
+def unpack_v_q2(pack: LayerPack, vc):
+    q_t, q_r = pack.q2_nb
+    top = vc[..., :q_t]
+    top = torch.cat([top & 15, top >> 4], -1)[..., :pack.v_no]
+    r = vc[..., q_t:q_t + q_r]
+    f = torch.cat([(r >> (2 * i)) & 3 for i in range(4)], -1)[..., :pack.rv - pack.v_no]
+    rest = (1 + 2 * (f & 1)) | ((f >> 1) << 3)                  # back to E2M1 codes
+    return torch.cat([top, rest.to(torch.uint8)], -1)
+
+
+def write(pack: LayerPack, x: torch.Tensor, v_layout="nib"):
     """x: [B, T, D] attention input (after the layer norm). -> dict of cache tensors for T tokens."""
     xf = x.float()
     ck = xf @ pack.B_k.T
@@ -232,16 +264,18 @@ def write(pack: LayerPack, x: torch.Tensor):
     cv = xf @ pack.B_v.T
     ct, st, _ = quantize_per_token(cv[..., :pack.v_no], pack.v_bits[0])
     cr, sr, _ = quantize_per_token(cv[..., pack.v_no:], pack.v_bits[1])
-    return dict(kc=pack_nibbles(kcodes), ks=ks, vc=pack_v_codes(pack, torch.cat([ct, cr], -1)),
-                vs=torch.stack([st, sr], -1), al=(xf @ pack.mu_scaled).to(torch.bfloat16))
+    vcodes = torch.cat([ct, cr], -1)
+    vc = pack_v_q2(pack, vcodes) if v_layout == "q2" else pack_v_codes(pack, vcodes)
+    return dict(kc=pack_nibbles(kcodes), ks=ks, vc=vc, vs=torch.stack([st, sr], -1),
+                al=(xf @ pack.mu_scaled).to(torch.bfloat16), v_layout=v_layout)
 
 
-def random_cache(pack: LayerPack, B, T, device="cuda"):
+def random_cache(pack: LayerPack, B, T, device="cuda", v_layout="nib"):
     """Random bytes in the cache layout (any byte is a pair of valid E2M1 codes), for timing."""
     u8 = lambda *s: torch.randint(0, 256, s, dtype=torch.uint8, device=device)
     return dict(kc=u8(B, T, pack.rk // 2),
                 ks=(torch.rand(B, T, pack.rk // 16, device=device) + 0.5).to(torch.float8_e4m3fn),
-                vc=u8(B, T, pack.v_row),
+                vc=u8(B, T, pack.q2_row if v_layout == "q2" else pack.v_row), v_layout=v_layout,
                 vs=(torch.rand(B, T, 2, device=device) + 0.5).to(torch.bfloat16),
                 al=torch.ones(B, T, dtype=torch.bfloat16, device=device))
 
@@ -411,9 +445,11 @@ def latent_pv(pack: LayerPack, p, cache, seqlen, col0, z, beta, **cfg):
 
 
 @triton.jit
-def _exact_logits_kernel(Q, KE, LG, E, E_pad, qk_scale, s_qb, s_kb, s_kg, s_ke, s_lb, s_lh,
-                         REP: tl.constexpr, D: tl.constexpr, EP: tl.constexpr, QP: tl.constexpr):
-    """Logits of the exact (bf16, rotated) tokens of one kv head into LG[:, :, :E]; -inf up to E_pad."""
+def _exact_logits_kernel(Q, KE, LG, MX, E, E_pad, qk_scale, s_qb, s_kb, s_kg, s_ke, s_lb, s_lh,
+                         REP: tl.constexpr, D: tl.constexpr, EP: tl.constexpr, QP: tl.constexpr,
+                         N_Q: tl.constexpr, HAS_MX: tl.constexpr):
+    """Logits of the exact (bf16, rotated) tokens of one kv head into LG[:, :, :E]; -inf up to E_pad.
+    HAS_MX: fold each query head's max into MX (ordered-int encoding)."""
     b = tl.program_id(0)
     g = tl.program_id(1)
     jq = tl.arange(0, QP)
@@ -424,6 +460,38 @@ def _exact_logits_kernel(Q, KE, LG, E, E_pad, qk_scale, s_qb, s_kb, s_kg, s_ke, 
     k = tl.load(KE + b * s_kb + g * s_kg + e[:, None] * s_ke + dd[None, :], mask=(e < E)[:, None], other=0.0)
     sc = tl.where((e < E)[None, :], tl.dot(q, tl.trans(k)) * qk_scale, float("-inf"))
     tl.store(LG + b * s_lb + (g * REP + jq)[:, None] * s_lh + e[None, :], sc, mask=qm[:, None] & (e < E_pad)[None, :])
+    if HAS_MX:
+        mi = tl.max(sc, 1).to(tl.int32, bitcast=True)
+        mi = tl.where(mi >= 0, mi, mi ^ 0x7FFFFFFF)
+        tl.atomic_max(MX + b * N_Q + g * REP + jq, mi, mask=qm)
+
+
+@triton.jit
+def _exact_pv_softmax_kernel(LG, MX, VE, O, LSUM, E, s_lb, s_lh, s_vb, s_vg, s_ve, s_ob,
+                             N_Q: tl.constexpr, REP: tl.constexpr, D: tl.constexpr, EC: tl.constexpr,
+                             QP: tl.constexpr):
+    """o[b, h] += exp(l_exact - max) . V_exact and lsum[b, h] += sum exp(l_exact - max)."""
+    b = tl.program_id(0)
+    g = tl.program_id(1)
+    jq = tl.arange(0, QP)
+    qm = jq < REP
+    dd = tl.arange(0, D)
+    mi = tl.load(MX + b * N_Q + g * REP + jq, mask=qm, other=0)
+    m = tl.where(mi >= 0, mi, mi ^ 0x7FFFFFFF).to(tl.float32, bitcast=True)
+    acc = tl.zeros([QP, D], tl.float32)
+    ls = tl.zeros([QP], tl.float32)
+    for e0 in range(0, E, EC):
+        e = e0 + tl.arange(0, EC)
+        lg = tl.load(LG + b * s_lb + (g * REP + jq)[:, None] * s_lh + e[None, :],
+                     mask=qm[:, None] & (e < E)[None, :], other=float("-inf"))
+        pe = tl.exp2((lg - m[:, None]) * 1.4426950408889634)
+        pe = tl.where(qm[:, None] & (e < E)[None, :], pe, 0.0)
+        ls += tl.sum(pe, 1)
+        ve = tl.load(VE + b * s_vb + g * s_vg + e[:, None] * s_ve + dd[None, :], mask=(e < E)[:, None], other=0.0)
+        acc += tl.dot(pe.to(tl.bfloat16), ve)
+    o = O + b * s_ob + (g * REP + jq)[:, None] * D + dd[None, :]
+    tl.store(o, tl.load(o, mask=qm[:, None], other=0.0) + acc, mask=qm[:, None])
+    tl.atomic_add(LSUM + b * N_Q + g * REP + jq, ls, mask=qm)
 
 
 @triton.jit
@@ -493,8 +561,9 @@ def latent_decode(pack: LayerPack, q, cache, seqlen, pos0, exact=None, **cfg):
     EP = triton.next_power_of_2(E_pad) if E else 0
     if E:
         ke = exact[0]
-        _exact_logits_kernel[(B, pack.n_kv)](q, ke, lg, E, E_pad, qk, q.stride(0), ke.stride(0), ke.stride(1),
-                                             ke.stride(2), lg.stride(0), lg.stride(1), REP=rep, D=d, EP=EP, QP=16)
+        _exact_logits_kernel[(B, pack.n_kv)](q, ke, lg, lg, E, E_pad, qk, q.stride(0), ke.stride(0), ke.stride(1),
+                                             ke.stride(2), lg.stride(0), lg.stride(1), REP=rep, D=d, EP=EP, QP=16,
+                                             N_Q=pack.n_q, HAS_MX=False)
     if cfg.get("backend", "cuda") == "cuda":
         from .latent_cuda import latent_logits_cuda
         hk = latent_logits_cuda(pack, q, cache, seqlen, pos0, lg, E_pad, gh=cfg.get("gh"))
@@ -526,6 +595,53 @@ def latent_decode(pack: LayerPack, q, cache, seqlen, pos0, exact=None, **cfg):
     return o
 
 
+def latent_decode_fused(pack: LayerPack, q, cache, seqlen, pos0, exact=None, gh=None, n_seg=None):
+    """latent_decode with the lean logits kernel and the softmax fused into the PV kernel: the logits'
+    row max comes from the logits kernels (atomic), the PV kernel turns logits into exp(l - max) and
+    accumulates the normalizer, which the last step divides out."""
+    from .latent_cuda import latent_logits3_cuda, latent_pv_cuda, latent_pv2_cuda, ORD_NEG
+    B, dev, d = q.shape[0], q.device, pack.d
+    T = int(cache["kc"].shape[1])
+    rep = pack.n_q // pack.n_kv
+    E = 0 if exact is None else exact[0].shape[2]
+    E_pad = 16 * math.ceil(E / 16)
+    W = E_pad + 16 * math.ceil(T / 16)
+    lg = torch.empty(B, pack.n_q, W, device=dev)
+    if W > E_pad + T:
+        lg[..., E_pad + T:] = float("-inf")
+    mx = torch.full((B, pack.n_q), ORD_NEG, dtype=torch.int32, device=dev)
+    if E:
+        ke = exact[0]
+        _exact_logits_kernel[(B, pack.n_kv)](q, ke, lg, mx, E, E_pad, 1.0 / math.sqrt(d), q.stride(0), ke.stride(0),
+                                             ke.stride(1), ke.stride(2), lg.stride(0), lg.stride(1), REP=rep, D=d,
+                                             EP=triton.next_power_of_2(E_pad), QP=16, N_Q=pack.n_q, HAS_MX=True)
+    latent_logits3_cuda(pack, q, cache, seqlen, pos0, lg, E_pad, mx, gh=gh)
+    q2 = cache.get("v_layout") == "q2"
+    zw, A_v = (pack.q2_zw, pack.A_v_q2) if q2 else (pack.zw, pack.A_v_pad)
+    z = torch.zeros(B, pack.n_q, zw, device=dev)
+    beta = torch.zeros(B, pack.n_q, device=dev)
+    lsum = torch.zeros(B, pack.n_q, device=dev)
+    if q2:
+        latent_pv2_cuda(pack, lg, cache, seqlen, E_pad, mx, z, beta, lsum, n_seg=n_seg)
+    else:
+        latent_pv_cuda(pack, lg, cache, seqlen, E_pad, z, beta, n_seg=n_seg, mx=mx, lsum=lsum)
+    o = torch.zeros(B, pack.n_q, d, device=dev)
+    BB = 16 if B >= 16 else (8 if B >= 8 else 4)
+    n_b = math.ceil(B / BB)
+    n_sm = torch.cuda.get_device_properties(dev).multi_processor_count
+    n_s = max(1, min(math.ceil(zw / 64), math.ceil(n_sm / (pack.n_kv * n_b))))
+    r_per = 64 * math.ceil(zw / n_s / 64)
+    _lift_kernel[(pack.n_kv, n_b, math.ceil(zw / r_per))](
+        z, beta, A_v, pack.vbar, o, B, zw, r_per, z.stride(0), z.stride(1), o.stride(0),
+        N_Q=pack.n_q, REP=rep, D=d, BB=BB, RC=64, num_warps=4)
+    if E:
+        ve = exact[1]
+        _exact_pv_softmax_kernel[(B, pack.n_kv)](lg, mx, ve, o, lsum, E, lg.stride(0), lg.stride(1), ve.stride(0),
+                                                 ve.stride(1), ve.stride(2), o.stride(0), N_Q=pack.n_q, REP=rep,
+                                                 D=d, EC=32, QP=16)
+    return o / lsum[..., None]
+
+
 # --------------------------------------------------------------------------------------------
 # reference (PyTorch, fp32): dequantize the cache and attend
 # --------------------------------------------------------------------------------------------
@@ -547,7 +663,8 @@ def dequant_cache(pack: LayerPack, cache, T):
     for g in range(pack.n_kv):
         off, r = (int(v) for v in pack.head_i[g, :2])
         K.append(ku[..., off:off + r] @ pack.a_hat[g].T + al[..., None] * pack.kbar[g * pack.d:(g + 1) * pack.d])
-    vu = e2m1_decode(unpack_v_codes(pack, cache["vc"][:, :T]))
+    unpack = unpack_v_q2 if cache.get("v_layout") == "q2" else unpack_v_codes
+    vu = e2m1_decode(unpack(pack, cache["vc"][:, :T]))
     sc = torch.where(torch.arange(pack.rv, device=vu.device) < pack.v_no,
                      cache["vs"][:, :T, :1].float(), cache["vs"][:, :T, 1:].float())
     V = torch.einsum("btr,hdr->bthd", vu * sc, pack.A_v) + al[..., None, None] * pack.vbar.view(pack.n_kv, pack.d)

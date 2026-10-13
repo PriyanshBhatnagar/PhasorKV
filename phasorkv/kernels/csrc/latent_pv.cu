@@ -62,13 +62,15 @@ __device__ __forceinline__ void e2m1x4(uint32_t x, uint32_t& lo, uint32_t& hi) {
 }
 
 extern "C" __global__ void __launch_bounds__(NWARP * 32, 1)
-latent_pv(const float* __restrict__ p,          // [B, NQ, W] probabilities; latent token t at col0 + t
+latent_pv(const float* __restrict__ p,          // [B, NQ, W] logits (with mx) or probabilities; token t at col0 + t
           const uint8_t* __restrict__ vc,       // [B, Tmax, v_row]
           const uint16_t* __restrict__ vs,      // [B, Tmax, 2] bf16 (top, rest) scales
           const uint16_t* __restrict__ al,      // [B, Tmax] bf16 alpha
           const int* __restrict__ seqlen,       // [B]
           float* __restrict__ z,                // [B, NQ, zw] (padded columns) accumulated atomically
           float* __restrict__ beta,             // [B, NQ]
+          const int* __restrict__ mx,           // [B, NQ] ordered-int max of the logits, or null: p given
+          float* __restrict__ lsum,             // [B, NQ] softmax normalizer (with mx)
           int col0, int seg_len, int nb_t, int nb_r, int v_row, int zw,
           long long s_pb, long long s_ph, long long s_vcb, long long s_vct, long long s_vsb, long long s_alb,
           long long s_zb) {
@@ -120,7 +122,14 @@ latent_pv(const float* __restrict__ p,          // [B, NQ, W] probabilities; lat
     for (int x = 0; x < MAXBT; ++x)
 #pragma unroll
       for (int s = 0; s < 2; ++s) acc[m][x][s][0] = acc[m][x][s][1] = acc[m][x][s][2] = acc[m][x][s][3] = 0.f;
-  float bsum = 0.f;
+  float bsum = 0.f, lacc = 0.f;
+  // softmax pass: thread -> (head ph, tokens pt0 .. pt0 + BT / 8 - 1)
+  const int ph = tid >> 3, pt0 = (tid & 7) * (BT / 8);
+  float pm = 0.f;
+  if (mx != nullptr && ph < NQ) {
+    const int i = mx[b * NQ + ph];
+    pm = __int_as_float(i >= 0 ? i : i ^ 0x7FFFFFFF) * 1.4426950408889634f;
+  }
 
 #pragma unroll
   for (int i = 0; i < NSTAGE - 1; ++i) issue(i, l_beg + i * BT);
@@ -133,7 +142,21 @@ latent_pv(const float* __restrict__ p,          // [B, NQ, W] probabilities; lat
     const int nval = l_end - t0;                 // tokens of this stage inside the segment
     const float* pr = praw + st * NQ * PSTR;
     const uint32_t* sr = sraw + st * BT;
-    if (warp == 0) {                             // beta: lane = head
+    if (mx != nullptr) {                         // logits -> exp(l - max) in place; beta and the normalizer
+      if (ph < NQ) {
+        float* row = praw + st * NQ * PSTR + ph * PSTR;
+        const float* ar = araw + st * BT;
+#pragma unroll
+        for (int j = 0; j < BT / 8; ++j) {
+          const int t = pt0 + j;
+          const float pv = t < nval ? exp2f(fmaf(row[t], 1.4426950408889634f, -pm)) : 0.f;
+          row[t] = pv;
+          lacc += pv;
+          bsum += pv * ar[t];
+        }
+      }
+      __syncthreads();
+    } else if (warp == 0) {                      // beta: lane = head
       const float* ar = araw + st * BT;
 #pragma unroll
       for (int t = 0; t < BT; ++t) bsum += (t < nval) ? pr[lane * PSTR + t] * ar[t] : 0.f;
@@ -185,7 +208,16 @@ latent_pv(const float* __restrict__ p,          // [B, NQ, W] probabilities; lat
   }
   asm volatile("cp.async.wait_group 0;\n");
 
-  if (warp == 0) atomicAdd(beta + b * NQ + lane, bsum);
+  if (mx != nullptr) {                           // 8 lanes per head
+#pragma unroll
+    for (int o = 1; o < 8; o <<= 1) {
+      bsum += __shfl_xor_sync(0xffffffffu, bsum, o);
+      lacc += __shfl_xor_sync(0xffffffffu, lacc, o);
+    }
+    if ((tid & 7) == 0 && ph < NQ) { atomicAdd(beta + b * NQ + ph, bsum); atomicAdd(lsum + b * NQ + ph, lacc); }
+  } else if (warp == 0) {
+    atomicAdd(beta + b * NQ + lane, bsum);
+  }
 #pragma unroll
   for (int x = 0; x < MAXBT; ++x) {
     if (x < nmy) {

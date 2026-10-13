@@ -104,7 +104,7 @@ def module_pv(cfg):
     return _MOD_PV[key]
 
 
-def latent_pv_cuda(pack, p, cache, seqlen, col0, z, beta, n_seg=None, **cfg):
+def latent_pv_cuda(pack, p, cache, seqlen, col0, z, beta, n_seg=None, mx=None, lsum=None, **cfg):
     """latent_attn.latent_pv on the tensor cores; z is [B, n_q, pack.zw] (padded tier columns, see
     csrc/latent_pv.cu) and p's width must cover col0 + 16 * ceil(T / 16)."""
     B, T = p.shape[0], int(cache["vc"].shape[1])
@@ -123,6 +123,141 @@ def latent_pv_cuda(pack, p, cache, seqlen, col0, z, beta, n_seg=None, **cfg):
     smem = nst * (bt * (v_row + 16) + 32 * (bt + 4) * 4 + bt * 4 + bt * 4)
     i64 = lambda v: ("i64", int(v))
     module_pv(c).launch("latent_pv", (n_seg, B, 1), (32 * c["NWARP"], 1, 1), [
-        p, vc, vs, al, seqlen, z, beta, col0, seg, nb_t, nb_r, v_row, pack.zw,
+        p, vc, vs, al, seqlen, z, beta, mx if mx is not None else ("i64", 0),
+        lsum if lsum is not None else ("i64", 0), col0, seg, nb_t, nb_r, v_row, pack.zw,
         i64(p.stride(0)), i64(p.stride(1)), i64(vc.stride(0)), i64(vc.stride(1)), i64(vs.stride(0)),
         i64(al.stride(0)), i64(z.stride(0))], smem=smem)
+
+
+# ---- lean-epilogue logits kernel (csrc/latent_logits3.cu) ------------------------------------------
+_SRC3 = os.path.join(os.path.dirname(__file__), "csrc", "latent_logits3.cu")
+_MODS3 = {}
+
+
+def prepare3(pack):
+    """Operands of latent_logits3.cu: compact scale words [step][nt][8 rows] and the rank-1 kbar / ga
+    B words [n_kv][nt][8] (bf16 in the low half), on top of prepare()."""
+    c = prepare(pack)
+    if "sfrag3" in c:
+        return c
+    d, dev = pack.d, pack.a_codes.device
+    sfr, so, head = [], 0, c["head_i"].clone()
+    for g in range(pack.n_kv):
+        r, sco = int(pack.head_i[g, 1]), int(pack.head_i[g, 3])
+        if r == 0:
+            continue
+        nch = math.ceil(r / 64)
+        sc = pack.a_scales[sco:sco + d * nch * 4].view(torch.uint8).view(NT, 8, nch, 4)
+        sfr.append(sc.permute(2, 0, 1, 3).contiguous().view(torch.int32).flatten())   # c, nt, g
+        head[g, 3] = so
+        so += nch * NT * 8
+    for g in range(pack.n_kv):
+        if int(pack.head_i[g, 1]) == 0:
+            head[g, 3] = so
+    sfr.append(torch.zeros(NT * 8, dtype=torch.int32, device=dev))
+    kb = pack.kbar_pair / pack.head_f[:, None]                                      # [n_kv, 128] pair order
+    hi = kb.to(torch.bfloat16)
+    lo = (kb - hi.float()).to(torch.bfloat16)
+    u16 = lambda x: x.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
+    c["kbw3"] = (u16(hi) | (u16(lo) << 16)).contiguous()                              # [n_kv, NT * 8]
+    c["sfrag3"] = torch.cat(sfr)
+    c["head3"] = head.contiguous()
+    return c
+
+
+def module3(minb=2, rank1=True, prefetch=False, defines=()):
+    key = (minb, rank1, prefetch, *defines)
+    if key not in _MODS3:
+        _MODS3[key] = CubinModule(_SRC3, flags=("-O3", "-std=c++17", f"-DMINB={minb}",
+                                                *(("-DRANK1",) if rank1 else ()), *(("-DPREFETCH",) if prefetch else ()),
+                                                *(f"-D{d}" for d in defines)))
+    return _MODS3[key]
+
+
+ORD_NEG = -2 ** 31                       # ordered-int encoding below every float
+
+
+def decode_ord(m):
+    """int32 tensor of ordered-int maxima -> float32."""
+    return torch.where(m >= 0, m, m ^ 0x7FFFFFFF).view(torch.float32)
+
+
+def latent_logits3_cuda(pack, q, cache, seqlen, pos0, lg, col0, mx=None, gh=None, minb=2, rank1=True, prefetch=False,
+                        defines=(), nw=4):
+    """latent_logits_cuda with the lean epilogue; mx (int32 [B, n_q], ORD_NEG-initialized) receives
+    the running max of the written logits."""
+    c = prepare3(pack)
+    B, T = q.shape[0], int(cache["kc"].shape[1])
+    n_t = math.ceil(T / (16 * nw))
+    if gh is None:
+        n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+        gh = min(pack.n_kv, 8)
+        while gh > 1 and B * n_t * (pack.n_kv // gh) < 4 * n_sm:
+            gh //= 2
+    cos, sin = cos_sin(pack, pos0 + T)
+    kc, ks, al = cache["kc"], cache["ks"], cache["al"]
+    i64 = lambda v: ("i64", int(v))
+    null = torch.empty(0, dtype=torch.int32, device=q.device)
+    module3(minb, rank1, prefetch, (*defines, f"NW={nw}")).launch("latent_logits", (n_t, B, pack.n_kv // gh), (32 * nw, 1, 1), [
+        q, kc, ks, al, seqlen, c["afrag"], c["sfrag3"], c["head3"], pack.head_f, c["kbw3"], c["kbar"], cos, sin, lg,
+        mx if mx is not None else ("i64", 0), T, pos0, col0, 1.0 / math.sqrt(pack.d), gh,
+        i64(q.stride(0)), i64(kc.stride(0)), i64(kc.stride(1)), i64(ks.stride(0)), i64(ks.stride(1)),
+        i64(al.stride(0)), i64(lg.stride(0)), i64(lg.stride(1))])
+
+
+# ---- PV with the rest tier at 2 bits and the softmax fused (csrc/latent_pv2.cu) ---------------------
+_SRC_PV2 = os.path.join(os.path.dirname(__file__), "csrc", "latent_pv2.cu")
+_MOD_PV2 = {}
+
+
+def latent_pv2_cuda(pack, lg, cache, seqlen, col0, mx, z, beta, lsum, n_seg=None, bt=64, nstage=2, defines=(), ng=1):
+    """z: [B, n_q, zw] or [B, ncopy, n_q, zw] (segments spread over the copies; the caller sums them)."""
+    """z [B, 32, pack.q2_zw] += exp(lg - max) . V (q2 cache), beta, lsum likewise."""
+    B, T = lg.shape[0], int(cache["vc"].shape[1])
+    vc, vs, al = cache["vc"], cache["vs"], cache["al"]
+    q_t, q_r = pack.q2_nb
+    assert pack.n_q == 32 and q_t <= 128 * ng and q_r <= 256 * ng and z.shape[-1] == pack.q2_zw
+    ncopy, s_zc = (z.shape[1], z.stride(1)) if z.dim() == 4 else (1, 0)
+    assert lg.shape[2] >= col0 + 16 * math.ceil(T / 16)
+    key = (bt, nstage, *defines)
+    if key not in _MOD_PV2:
+        _MOD_PV2[key] = CubinModule(_SRC_PV2, flags=("-O3", "-std=c++17", f"-DBT={bt}", f"-DNSTAGE={nstage}",
+                                                     *(f"-D{d}" for d in defines)))
+    if n_seg is None:
+        n_sm = torch.cuda.get_device_properties(lg.device).multi_processor_count
+        n_seg = max(1, min(math.ceil(n_sm / (B * ng)), math.ceil(T / (4 * bt))))
+    seg = bt * math.ceil(math.ceil(T / n_seg) / bt)
+    n_seg = math.ceil(T / seg)
+    v_row = vc.shape[2]
+    smem = nstage * (bt * (v_row + 16) + 32 * (bt + 4) * 4 + bt * 4 + bt * 4)
+    i64 = lambda v: ("i64", int(v))
+    _MOD_PV2[key].launch("latent_pv2", (ng, n_seg, B), (512, 1, 1), [
+        lg, vc, vs, al, seqlen, mx, z, beta, lsum, col0, seg, q_t, q_r, v_row, pack.q2_zw, ng, ncopy, ("i64", s_zc),
+        i64(lg.stride(0)), i64(lg.stride(1)), i64(vc.stride(0)), i64(vc.stride(1)), i64(vs.stride(0)),
+        i64(al.stride(0)), i64(z.stride(0))], smem=smem)
+
+
+# ---- head halves in ping-pong (csrc/latent_logits4.cu) ------------------------------------------------
+_SRC4 = os.path.join(os.path.dirname(__file__), "csrc", "latent_logits4.cu")
+_MODS4 = {}
+
+
+def latent_logits4_cuda(pack, q, cache, seqlen, pos0, lg, col0, mx=None, gh=None, minb=3):
+    c = prepare3(pack)
+    B, T = q.shape[0], int(cache["kc"].shape[1])
+    n_t = math.ceil(T / 64)
+    if gh is None:
+        n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+        gh = min(pack.n_kv, 8)
+        while gh > 1 and B * n_t * (pack.n_kv // gh) < 4 * n_sm:
+            gh //= 2
+    if minb not in _MODS4:
+        _MODS4[minb] = CubinModule(_SRC4, flags=("-O3", "-std=c++17", f"-DMINB={minb}"))
+    cos, sin = cos_sin(pack, pos0 + T)
+    kc, ks, al = cache["kc"], cache["ks"], cache["al"]
+    i64 = lambda v: ("i64", int(v))
+    _MODS4[minb].launch("latent_logits", (n_t, B, pack.n_kv // gh), (128, 1, 1), [
+        q, kc, ks, al, seqlen, c["afrag"], c["sfrag3"], c["head3"], pack.head_f, c["kbw3"], c["kbar"], cos, sin, lg,
+        mx if mx is not None else ("i64", 0), T, pos0, col0, 1.0 / math.sqrt(pack.d), gh,
+        i64(q.stride(0)), i64(kc.stride(0)), i64(kc.stride(1)), i64(ks.stride(0)), i64(ks.stride(1)),
+        i64(al.stride(0)), i64(lg.stride(0)), i64(lg.stride(1))])

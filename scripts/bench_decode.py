@@ -50,33 +50,21 @@ def graph_time(fn, iters=20, warmup=3):
 
 
 def bench_latent(packs, B, T, dev, kw):
-    """-> (ms per step for all layers: kernels + softmax + exact tokens + V lift; ms of the two
-    kernels alone)."""
-    caches = [la.random_cache(p, B, T, dev) for p in packs]
+    """-> ms per step for all layers through latent_decode_fused (logits kernel, fused-softmax PV over
+    the 2-bit-rest V cache, exact sink / recent-window tokens, V lift, normalization)."""
+    caches = [la.random_cache(p, B, T, dev, v_layout="q2") for p in packs]
     q = torch.randn(B, N_Q, D_HEAD, device=dev).to(torch.bfloat16)
     seqlen = torch.full((B,), T, dtype=torch.int32, device=dev)
     ex = [(torch.randn(B, N_KV, EXACT, D_HEAD, device=dev).to(torch.bfloat16),
            torch.randn(B, N_KV, EXACT, D_HEAD, device=dev).to(torch.bfloat16)) for _ in packs]
-    lg = torch.randn(B, N_Q, 16 * math.ceil(T / 16), device=dev)
-    pr = torch.softmax(lg, -1)
-    z = [torch.zeros(B, N_Q, p.rv, device=dev) for p in packs]
-    beta = torch.zeros(B, N_Q, device=dev)
 
     def full():
         for p, c, e in zip(packs, caches, ex):
-            la.latent_decode(p, q, c, seqlen, 4, e, **kw)
-
-    from phasorkv.kernels.latent_cuda import latent_logits_cuda, latent_pv_cuda
-    zp = [torch.zeros(B, N_Q, p.zw, device=dev) for p in packs]
-
-    def kernels():
-        for p, c, zz in zip(packs, caches, zp):
-            latent_logits_cuda(p, q, c, seqlen, 4, lg, 0)
-            latent_pv_cuda(p, pr, c, seqlen, 0, zz, beta)
-    t_full, t_kern = graph_time(full), graph_time(kernels)
-    del caches, ex, lg, pr, z
+            la.latent_decode_fused(p, q, c, seqlen, 4, e, **kw)
+    t_full = graph_time(full)
+    del caches, ex
     torch.cuda.empty_cache()
-    return t_full, t_kern
+    return t_full, t_full
 
 
 def bench_dense(B, T, dev, fp8, budget):
@@ -150,12 +138,12 @@ def main():
         packs = [la.synthetic_pack(N_Q, N_KV, D_HEAD, D_MODEL, [(h, r) for h, r in l["k_blocks"]], l["rv"],
                                    device=dev, seed=i)
                  for i, l in sorted(((int(i), l) for i, l in layers.items() if l))]
-        bpt = sum(p.bytes_per_token() for p in packs)
+        bpt = sum(p.bytes_per_token("q2") for p in packs)
         bpt_packed = sum(p.bytes_per_token_packed() for p in packs)
         flops = sum(p.k_rebuild_flops for p in packs)
         for p_ in packs:                                      # the benchmark never runs the write path
             p_.B_k = p_.B_v = None
-        print(f"{name}: {bpt / 1024:.1f} KiB/token (4-bit codes), {bpt_packed / 1024:.1f} KiB/token packed, "
+        print(f"{name}: {bpt / 1024:.1f} KiB/token (stored: 4-bit K, 2-bit V rest tier), {bpt_packed / 1024:.1f} KiB/token fully packed, "
               f"K rebuild {flops / 1e6:.2f} MFLOP/token", flush=True)
         for T in lens:
             for B in batches:
