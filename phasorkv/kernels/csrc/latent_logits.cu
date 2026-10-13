@@ -1,6 +1,10 @@
 // Logits over the PhasorKV latent K cache, sm_120a (Blackwell GeForce / RTX PRO).
 //
-// One CTA = 64 tokens (4 warps x 16) of one sequence, for GH kv heads in turn. Per warp and kv head:
+// One CTA = 64 tokens (4 warps x 16) of one sequence, for GH kv heads in turn. The CTA walks the
+// heads' 64-wide latent steps as one flat sequence: the rebuild-weight fragments of the next steps
+// are staged in shared memory with cp.async (NBUF buffers, shared by the 4 warps) and the next
+// step's latent codes are prefetched into registers while the current step's MMAs run; the query
+// (as RoPE-pair words) and kbar sit in shared memory for the epilogues. Per warp and kv head:
 //   1. k[16 x 128] = codes[16 x r] . A'^T: the block-scaled FP4 MMA (m16n8k64, NVFP4 x NVFP4, E4M3
 //      scales per 16, fp32 accumulate), 16 n-tiles over the head dim per 64-wide latent step. The
 //      latent codes are the A operand straight from the token-major cache (a byte holds latent
@@ -42,10 +46,18 @@ __device__ __forceinline__ void mma_bf16(float* d, uint32_t a0, uint32_t a1, uin
 __device__ __forceinline__ float bf(uint32_t bits16) { return __uint_as_float(bits16 << 16); }
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {   // round to nearest even
-  uint32_t a = __float_as_uint(lo), b = __float_as_uint(hi);
-  a = (a + 0x7FFFu + ((a >> 16) & 1u)) >> 16;
-  b = (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16;
-  return a | (b << 16);
+  uint32_t r;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+
+#ifndef MAXGH
+#define MAXGH 8
+#endif
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+  unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
 }
 
 extern "C" __global__ void __launch_bounds__(128)
@@ -65,7 +77,15 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
               int t_max, int pos0, int col0, float qk_scale, int gh,
               long long s_qb, long long s_kcb, long long s_kct, long long s_ksb, long long s_kst,
               long long s_alb, long long s_lb, long long s_lh) {
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#ifndef NBUF
+#define NBUF 3
+#endif
+  __shared__ __align__(16) uint2 bsm[NBUF][NT * 32];    // B fragments of NBUF steps (prefetch NBUF - 1 ahead)
+  __shared__ __align__(16) uint32_t ssm[NBUF][NT * 32]; // and their scale words
+  __shared__ uint32_t qsm[MAXGH][8][64];                // per kv head: query heads (rows 4..7 zero) as pair words
+  __shared__ float2 ksm[MAXGH][4][NT];                  // per kv head: kbar in thread order
+
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, tq = lane & 3;
   const int b = blockIdx.y, pg = blockIdx.z;
   const int T = seqlen[b];
@@ -74,12 +94,24 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
   const float NEG = -__int_as_float(0x7f800000);
 
   if (blockIdx.x * 64 >= T) {                   // tile past this sequence: -inf logits only
-    for (int i = threadIdx.x; i < 64 * gh * REP; i += 128) {
+    for (int i = tid; i < 64 * gh * REP; i += 128) {
       int t = blockIdx.x * 64 + (i & 63), h = pg * gh * REP + (i >> 6);
       if (t < t_max) lg[b * s_lb + h * s_lh + col0 + t] = NEG;
     }
     return;
   }
+  // query pair words and kbar of this CTA's kv heads
+  for (int i = tid; i < gh * 8 * 64; i += 128) {
+    const int gi = i >> 9, j = (i >> 6) & 7, pp = i & 63;
+    uint32_t w = 0u;
+    if (j < REP) {
+      const uint16_t* qh = q + b * s_qb + (long long)((pg * gh + gi) * REP + j) * HD;
+      w = (uint32_t)qh[pp] | ((uint32_t)qh[pp + 64] << 16);
+    }
+    qsm[gi][j][pp] = w;
+  }
+  for (int i = tid; i < gh * 64; i += 128) (&ksm[0][0][0])[i] = kbar[(long long)pg * gh * 64 + i];
+
   const bool vA = tA < T, vB = tB < T;
   const float alA = vA ? bf(al[b * s_alb + tA]) : 0.f;
   const float alB = vB ? bf(al[b * s_alb + tB]) : 0.f;
@@ -105,78 +137,95 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
   const uint8_t* ksA = ks + b * s_ksb + (long long)(vA ? tA : 0) * s_kst;
   const uint8_t* ksB = ks + b * s_ksb + (long long)(vB ? tB : 0) * s_kst;
 
-  for (int gi = 0; gi < gh; ++gi) {
+  // a step = (head gi, 64-wide latent chunk c); heads with no latent take one all-zero step
+  auto nsteps = [&](int gi) { return max(1, (head_i[(pg * gh + gi) * 4 + 1] + 63) >> 6); };
+  auto issue_b = [&](int buf, int gi, int c) {   // cp.async one step's fragments: 4 KB + 2 KB
+    const int kvh = pg * gh + gi;
+    const uint2* src = afrag + head_i[kvh * 4 + 2] + (long long)c * NT * 32;
+    const uint32_t* ssrc = sfrag + head_i[kvh * 4 + 3] + (long long)c * NT * 32;
+    cp_async16(&bsm[buf][tid * 2], src + tid * 2);
+    cp_async16(&bsm[buf][256 + tid * 2], src + 256 + tid * 2);
+    cp_async16(&ssm[buf][tid * 4], ssrc + tid * 4);
+  };
+  auto load_a = [&](int gi, int c, uint32_t* a, uint32_t& sa) {
     const int kvh = pg * gh + gi;
     const int lat = head_i[kvh * 4], rk = head_i[kvh * 4 + 1];
-    const int fo = head_i[kvh * 4 + 2], so = head_i[kvh * 4 + 3];
-    const float ga = head_f[kvh];
-    float acc[NT][4];
-#pragma unroll
-    for (int nt = 0; nt < NT; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
-
-    const int nch = (rk + 63) >> 6;
-    for (int c = 0; c < nch; ++c) {
-      const int byte0 = (lat >> 1) + c * 32;
-      const bool hi = c * 64 + 32 < rk;
-      uint32_t a0 = vA ? *reinterpret_cast<const uint32_t*>(kcA + byte0) : 0u;
-      uint32_t a1 = vB ? *reinterpret_cast<const uint32_t*>(kcB + byte0) : 0u;
-      uint32_t a2 = (vA && hi) ? *reinterpret_cast<const uint32_t*>(kcA + byte0 + 16) : 0u;
-      uint32_t a3 = (vB && hi) ? *reinterpret_cast<const uint32_t*>(kcB + byte0 + 16) : 0u;
-      uint32_t sa = 0u;
-      const int sbyte = (lat >> 4) + c * 4;                      // 2-byte aligned
-      if (tq == 0 && vA) {
-        const uint16_t* p = reinterpret_cast<const uint16_t*>(ksA + sbyte);
-        sa = (uint32_t)p[0] | ((uint32_t)(hi ? p[1] : 0) << 16);
-      } else if (tq == 1 && vB) {
-        const uint16_t* p = reinterpret_cast<const uint16_t*>(ksB + sbyte);
-        sa = (uint32_t)p[0] | ((uint32_t)(hi ? p[1] : 0) << 16);
-      }
-      const uint2* bf2 = afrag + fo + (long long)c * NT * 32 + lane;
-      const uint32_t* sf = sfrag + so + (long long)c * NT * 32 + lane;
-#pragma unroll
-      for (int nt = 0; nt < NT; ++nt) {
-        const uint2 bb = __ldg(bf2 + nt * 32);
-        const uint32_t sb = __ldg(sf + nt * 32);
-        mma_fp4(acc[nt], a0, a1, a2, a3, bb.x, bb.y, sa, sb);
-      }
+    const bool lo = c * 64 < rk, hi = c * 64 + 32 < rk;
+    const int byte0 = (lat >> 1) + c * 32;
+    a[0] = (vA && lo) ? *reinterpret_cast<const uint32_t*>(kcA + byte0) : 0u;
+    a[1] = (vB && lo) ? *reinterpret_cast<const uint32_t*>(kcB + byte0) : 0u;
+    a[2] = (vA && hi) ? *reinterpret_cast<const uint32_t*>(kcA + byte0 + 16) : 0u;
+    a[3] = (vB && hi) ? *reinterpret_cast<const uint32_t*>(kcB + byte0 + 16) : 0u;
+    sa = 0u;
+    const int sbyte = (lat >> 4) + c * 4;
+    if (lo && ((tq == 0 && vA) || (tq == 1 && vB))) {
+      const uint16_t* p = reinterpret_cast<const uint16_t*>((tq == 0 ? ksA : ksB) + sbyte);
+      sa = (uint32_t)p[0] | ((uint32_t)(hi ? p[1] : 0) << 16);
     }
+  };
 
-    // query heads of this kv head as the bf16 MMA's B operand: col g = head g (g < REP), k in pair order
-    uint32_t qb[8][2];
-    {
-      const uint16_t* qh = q + b * s_qb + (long long)(kvh * REP + (g < REP ? g : 0)) * HD;
+  float acc[NT][4];
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+  // the flat step sequence, NBUF - 1 steps of fragments in flight
+  int pf_g = 0, pf_c = 0, pf_ns = nsteps(0);     // next step to prefetch
+  auto advance = [&](int& g_, int& c_, int& n_) {
+    if (++c_ >= n_) { ++g_; c_ = 0; if (g_ < gh) n_ = nsteps(g_); }
+  };
+#pragma unroll
+  for (int i = 0; i < NBUF - 1; ++i) {
+    if (pf_g < gh) { issue_b(i, pf_g, pf_c); advance(pf_g, pf_c, pf_ns); }
+    asm volatile("cp.async.commit_group;\n");
+  }
+  int gi = 0, c = 0, ns = nsteps(0), it = 0;
+  uint32_t an[4], san;
+  load_a(0, 0, an, san);
+  while (true) {
+    uint32_t a[4] = {an[0], an[1], an[2], an[3]}, sa = san;
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(NBUF - 2));
+    __syncthreads();                             // this step's fragments landed; the slot refilled below is free
+    if (pf_g < gh) { issue_b((it + NBUF - 1) % NBUF, pf_g, pf_c); advance(pf_g, pf_c, pf_ns); }
+    asm volatile("cp.async.commit_group;\n");
+    int gn = gi, cn = c, nn = ns;
+    advance(gn, cn, nn);
+    const bool more = gn < gh;
+    if (more) load_a(gn, cn, an, san);           // next step's latent codes in flight
+    const int buf = it % NBUF;
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      const uint2 bb = bsm[buf][nt * 32 + lane];
+      mma_fp4(acc[nt], a[0], a[1], a[2], a[3], bb.x, bb.y, sa, ssm[buf][nt * 32 + lane]);
+    }
+    if (c == ns - 1) {                           // head complete: rotate, score, store
+      const int kvh = pg * gh + gi;
+      const float ga = head_f[kvh];
+      float lo[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int kt = 0; kt < 8; ++kt) {
-        const int p0 = 8 * kt + tq, p1 = 8 * kt + 4 + tq;
-        qb[kt][0] = g < REP ? ((uint32_t)qh[p0] | ((uint32_t)qh[p0 + 64] << 16)) : 0u;
-        qb[kt][1] = g < REP ? ((uint32_t)qh[p1] | ((uint32_t)qh[p1 + 64] << 16)) : 0u;
+        uint32_t ar[4];
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+          const int nt = 2 * kt + s;
+          const float2 kv = ksm[gi][tq][nt];
+          const uint32_t cpA = cA[nt >> 1], spA = sA[nt >> 1], cpB = cB[nt >> 1], spB = sB[nt >> 1];
+          const float ca = bf((nt & 1) ? cpA >> 16 : cpA & 0xFFFF), sa_ = bf((nt & 1) ? spA >> 16 : spA & 0xFFFF);
+          const float cb = bf((nt & 1) ? cpB >> 16 : cpB & 0xFFFF), sb_ = bf((nt & 1) ? spB >> 16 : spB & 0xFFFF);
+          const float x0A = fmaf(acc[nt][0], ga, alA * kv.x), x1A = fmaf(acc[nt][1], ga, alA * kv.y);
+          const float x0B = fmaf(acc[nt][2], ga, alB * kv.x), x1B = fmaf(acc[nt][3], ga, alB * kv.y);
+          ar[2 * s] = pack_bf16(x0A * ca - x1A * sa_, x1A * ca + x0A * sa_);
+          ar[2 * s + 1] = pack_bf16(x0B * cb - x1B * sb_, x1B * cb + x0B * sb_);
+          acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+        }
+        mma_bf16(lo, ar[0], ar[1], ar[2], ar[3], qsm[gi][g][8 * kt + tq], qsm[gi][g][8 * kt + 4 + tq]);
+      }
+      if (tq < 2) {                              // lo: (token tA, heads 2tq, 2tq + 1), (token tB, ...)
+        const int h = kvh * REP + 2 * tq;
+        float* o = lg + b * s_lb + (long long)h * s_lh + col0;
+        if (tA < t_max) { o[tA] = vA ? lo[0] * qk_scale : NEG; o[s_lh + tA] = vA ? lo[1] * qk_scale : NEG; }
+        if (tB < t_max) { o[tB] = vB ? lo[2] * qk_scale : NEG; o[s_lh + tB] = vB ? lo[3] * qk_scale : NEG; }
       }
     }
-    const float2* kb = kbar + (long long)kvh * 64 + tq * NT;
-    float lo[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-    for (int kt = 0; kt < 8; ++kt) {
-      uint32_t ar[4];
-#pragma unroll
-      for (int s = 0; s < 2; ++s) {
-        const int nt = 2 * kt + s;
-        const float2 kv = __ldg(kb + nt);
-        const uint32_t cpA = cA[nt >> 1], spA = sA[nt >> 1], cpB = cB[nt >> 1], spB = sB[nt >> 1];
-        const float ca = bf((nt & 1) ? cpA >> 16 : cpA & 0xFFFF), sa_ = bf((nt & 1) ? spA >> 16 : spA & 0xFFFF);
-        const float cb = bf((nt & 1) ? cpB >> 16 : cpB & 0xFFFF), sb_ = bf((nt & 1) ? spB >> 16 : spB & 0xFFFF);
-        const float x0A = fmaf(acc[nt][0], ga, alA * kv.x), x1A = fmaf(acc[nt][1], ga, alA * kv.y);
-        const float x0B = fmaf(acc[nt][2], ga, alB * kv.x), x1B = fmaf(acc[nt][3], ga, alB * kv.y);
-        ar[2 * s] = pack_bf16(x0A * ca - x1A * sa_, x1A * ca + x0A * sa_);
-        ar[2 * s + 1] = pack_bf16(x0B * cb - x1B * sb_, x1B * cb + x0B * sb_);
-      }
-      mma_bf16(lo, ar[0], ar[1], ar[2], ar[3], qb[kt][0], qb[kt][1]);
-    }
-    // lo: (token tA, heads 2tq, 2tq + 1), (token tB, ...)
-    if (tq < 2) {
-      const int h = kvh * REP + 2 * tq;
-      float* o = lg + b * s_lb + (long long)h * s_lh + col0;
-      if (tA < t_max) { o[tA] = vA ? lo[0] * qk_scale : NEG; o[s_lh + tA] = vA ? lo[1] * qk_scale : NEG; }
-      if (tB < t_max) { o[tB] = vB ? lo[2] * qk_scale : NEG; o[s_lh + tB] = vB ? lo[3] * qk_scale : NEG; }
-    }
+    if (!more) break;
+    gi = gn; c = cn; ns = nn; ++it;
   }
 }

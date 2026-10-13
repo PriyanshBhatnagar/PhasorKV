@@ -36,6 +36,10 @@ class CubinModule:
         f = self.fns.get(name)
         if f is None:
             f = self.fns[name] = _ok(cu.cuModuleGetFunction(self.mod, name.encode()))
+            self.smem_ok = getattr(self, "smem_ok", {})
+        if smem > 48 * 1024 and self.smem_ok.get(name, 0) < smem:      # opt in to large dynamic smem
+            _ok(cu.cuFuncSetAttribute(f, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem))
+            self.smem_ok[name] = smem
         vals = []
         for a in args:
             if isinstance(a, torch.Tensor):

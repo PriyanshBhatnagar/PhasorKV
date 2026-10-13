@@ -60,11 +60,17 @@ class LayerPack:
         h = self.d // 2
         self.pair = torch.stack([torch.arange(h), torch.arange(h) + h], -1).flatten()   # 0, h, 1, h+1, ...
         self.kbar_pair = self.kbar.view(self.n_kv, self.d)[:, self.pair.to(self.kbar.device)].contiguous()
-        nb_t, nb_r = (self.v_no + 1) // 2, (self.rv - self.v_no + 1) // 2
+        nb_t, nb_r = (8 * math.ceil(w / 16) for w in (self.v_no, self.rv - self.v_no))   # bytes per tier
         self.v_nb = (nb_t, nb_r)
         self.v_row = 16 * math.ceil((nb_t + nb_r) / 16)        # bytes per token, 16-aligned
         self._cs = None
         self.A_v_bf16 = self.A_v.to(torch.bfloat16).contiguous()
+        # the CUDA PV kernel's z columns: [top tier, padded to 2 nb_t][rest tier, padded to 2 nb_r]
+        self.zw = 2 * (nb_t + nb_r)
+        A = torch.zeros(self.n_kv, self.d, self.zw, device=self.A_v.device)
+        A[..., :self.v_no] = self.A_v[..., :self.v_no]
+        A[..., 2 * nb_t:2 * nb_t + self.rv - self.v_no] = self.A_v[..., self.v_no:]
+        self.A_v_pad = A.to(torch.bfloat16).contiguous()
 
     @property
     def k_rebuild_flops(self):
@@ -480,7 +486,10 @@ def latent_decode(pack: LayerPack, q, cache, seqlen, pos0, exact=None, **cfg):
     E = 0 if exact is None else exact[0].shape[2]
     E_pad = 16 * math.ceil(E / 16)                 # latent columns start 64-byte aligned
     qk = 1.0 / math.sqrt(d)
-    lg = torch.empty(B, pack.n_q, E_pad + T, device=dev)
+    W = E_pad + 16 * math.ceil(T / 16)              # rows 64-byte aligned for the PV kernel's copies
+    lg = torch.empty(B, pack.n_q, W, device=dev)
+    if W > E_pad + T:
+        lg[..., E_pad + T:] = float("-inf")
     EP = triton.next_power_of_2(E_pad) if E else 0
     if E:
         ke = exact[0]
@@ -492,18 +501,23 @@ def latent_decode(pack: LayerPack, q, cache, seqlen, pos0, exact=None, **cfg):
     else:
         hk = latent_logits(pack, q, cache, seqlen, pos0, lg, E_pad, **cfg)
     p = torch.softmax(lg, -1)
-    z = torch.zeros(B, pack.n_q, pack.rv, device=dev)
     beta = torch.zeros(B, pack.n_q, device=dev)
-    hv = latent_pv(pack, p, cache, seqlen, E_pad, z, beta, **cfg)
+    if cfg.get("pv_backend", "cuda") == "cuda":
+        from .latent_cuda import latent_pv_cuda
+        z, A_v, rv = torch.zeros(B, pack.n_q, pack.zw, device=dev), pack.A_v_pad, pack.zw
+        hv = latent_pv_cuda(pack, p, cache, seqlen, E_pad, z, beta, n_seg=cfg.get("n_seg"))
+    else:
+        z, A_v, rv = torch.zeros(B, pack.n_q, pack.rv, device=dev), pack.A_v_bf16, pack.rv
+        hv = latent_pv(pack, p, cache, seqlen, E_pad, z, beta, **cfg)
     latent_decode.last = (hk, hv)
     o = torch.zeros(B, pack.n_q, d, device=dev)
     BB = 16 if B >= 16 else (8 if B >= 8 else 4)
     n_b = math.ceil(B / BB)
     n_sm = torch.cuda.get_device_properties(dev).multi_processor_count
-    n_s = max(1, min(math.ceil(pack.rv / 64), math.ceil(n_sm / (pack.n_kv * n_b))))
-    r_per = 64 * math.ceil(pack.rv / n_s / 64)
-    _lift_kernel[(pack.n_kv, n_b, math.ceil(pack.rv / r_per))](
-        z, beta, pack.A_v_bf16, pack.vbar, o, B, pack.rv, r_per, z.stride(0), z.stride(1), o.stride(0),
+    n_s = max(1, min(math.ceil(rv / 64), math.ceil(n_sm / (pack.n_kv * n_b))))
+    r_per = 64 * math.ceil(rv / n_s / 64)
+    _lift_kernel[(pack.n_kv, n_b, math.ceil(rv / r_per))](
+        z, beta, A_v, pack.vbar, o, B, rv, r_per, z.stride(0), z.stride(1), o.stride(0),
         N_Q=pack.n_q, REP=rep, D=d, BB=BB, RC=64, num_warps=4)
     if E:
         ve = exact[1]
