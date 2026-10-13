@@ -11,7 +11,8 @@ import torch
 
 from .cubin import CubinModule
 
-_SRC = os.path.join(os.path.dirname(__file__), "csrc", "latent_logits.cu")
+_SRC = os.path.join(os.path.dirname(__file__), "csrc", "latent_logits.cu")         # 16 tokens / warp
+_SRC2 = os.path.join(os.path.dirname(__file__), "csrc", "latent_logits2.cu")       # 32 tokens / warp
 _SRC_PV = os.path.join(os.path.dirname(__file__), "csrc", "latent_pv.cu")
 NT, LANES = 16, 32
 PAIR_PERM = [4 * nt + tq for tq in range(4) for nt in range(NT)]      # column tq * 16 + nt -> pair
@@ -20,10 +21,10 @@ PAIR_PERM = [4 * nt + tq for tq in range(4) for nt in range(NT)]      # column t
 _MODS = {}
 
 
-def module(defines=()):
-    key = tuple(defines)
+def module(defines=(), wide=False):
+    key = (wide, *defines)
     if key not in _MODS:
-        _MODS[key] = CubinModule(_SRC, flags=("-O3", "-std=c++17", *(f"-D{d}" for d in key)))
+        _MODS[key] = CubinModule(_SRC2 if wide else _SRC, flags=("-O3", "-std=c++17", *(f"-D{d}" for d in defines)))
     return _MODS[key]
 
 
@@ -72,11 +73,11 @@ def cos_sin(pack, n_pos):
     return c["cs"]
 
 
-def latent_logits_cuda(pack, q, cache, seqlen, pos0, lg, col0, gh=None, defines=()):
+def latent_logits_cuda(pack, q, cache, seqlen, pos0, lg, col0, gh=None, defines=(), wide=False):
     """Same contract as latent_attn.latent_logits."""
     c = prepare(pack)
     B, T = q.shape[0], int(cache["kc"].shape[1])
-    n_t = math.ceil(T / 64)
+    n_t = math.ceil(T / (128 if wide else 64))
     if gh is None:
         n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
         gh = min(pack.n_kv, 8)
@@ -85,7 +86,7 @@ def latent_logits_cuda(pack, q, cache, seqlen, pos0, lg, col0, gh=None, defines=
     cos, sin = cos_sin(pack, pos0 + T)
     kc, ks, al = cache["kc"], cache["ks"], cache["al"]
     i64 = lambda v: ("i64", int(v))
-    module(defines).launch("latent_logits", (n_t, B, pack.n_kv // gh), (128, 1, 1), [
+    module(defines, wide).launch("latent_logits", (n_t, B, pack.n_kv // gh), (128, 1, 1), [
         q, kc, ks, al, seqlen, c["afrag"], c["sfrag"], c["head_i"], pack.head_f, c["kbar"], cos, sin, lg,
         T, pos0, col0, 1.0 / math.sqrt(pack.d), gh,
         i64(q.stride(0)), i64(kc.stride(0)), i64(kc.stride(1)), i64(ks.stride(0)), i64(ks.stride(1)),

@@ -57,7 +57,7 @@ def bench_latent(packs, B, T, dev, kw):
     seqlen = torch.full((B,), T, dtype=torch.int32, device=dev)
     ex = [(torch.randn(B, N_KV, EXACT, D_HEAD, device=dev).to(torch.bfloat16),
            torch.randn(B, N_KV, EXACT, D_HEAD, device=dev).to(torch.bfloat16)) for _ in packs]
-    lg = torch.randn(B, N_Q, T, device=dev)
+    lg = torch.randn(B, N_Q, 16 * math.ceil(T / 16), device=dev)
     pr = torch.softmax(lg, -1)
     z = [torch.zeros(B, N_Q, p.rv, device=dev) for p in packs]
     beta = torch.zeros(B, N_Q, device=dev)
@@ -66,10 +66,13 @@ def bench_latent(packs, B, T, dev, kw):
         for p, c, e in zip(packs, caches, ex):
             la.latent_decode(p, q, c, seqlen, 4, e, **kw)
 
+    from phasorkv.kernels.latent_cuda import latent_logits_cuda, latent_pv_cuda
+    zp = [torch.zeros(B, N_Q, p.zw, device=dev) for p in packs]
+
     def kernels():
-        for p, c, zz in zip(packs, caches, z):
-            la.latent_logits(p, q, c, seqlen, 4, lg, 0, **kw)
-            la.latent_pv(p, pr, c, seqlen, 0, zz, beta, **kw)
+        for p, c, zz in zip(packs, caches, zp):
+            latent_logits_cuda(p, q, c, seqlen, 4, lg, 0)
+            latent_pv_cuda(p, pr, c, seqlen, 0, zz, beta)
     t_full, t_kern = graph_time(full), graph_time(kernels)
     del caches, ex, lg, pr, z
     torch.cuda.empty_cache()
