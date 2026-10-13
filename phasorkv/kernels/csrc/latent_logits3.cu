@@ -57,6 +57,8 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
               const int* __restrict__ seqlen,       // [B]
               const uint2* __restrict__ afrag,      // per kv head [steps][NT][32 lanes] (b0, b1)
               const uint32_t* __restrict__ sfrag,   // per kv head [steps][NT][8 rows] scale word
+              const uint32_t* __restrict__ afrag4,  // WIDEB: per kv head [steps][NT/2][32 lanes][4] (two n-tiles' b0 b1)
+              const uint32_t* __restrict__ sfrag4,  // WIDEB: per kv head [steps][NT/4][8 rows][4] (four n-tiles' scales)
               const int* __restrict__ head_i,       // [n_kv][4]: latent offset, rank, afrag off, sfrag off
               const float* __restrict__ head_f,     // [n_kv] ga
               const uint32_t* __restrict__ kbw,     // [n_kv][NT][8]: bf16x2 (hi, lo) of kbar / ga, column 8 nt + g (RANK1)
@@ -65,7 +67,7 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
               const uint16_t* __restrict__ sinp,
               float* __restrict__ lg,               // [B, n_q, width]: col0 + t
               int* __restrict__ mx,                 // [B, n_q] ordered-int running max (or null)
-              int t_max, int pos0, int col0, float qk_scale, int gh,
+              int t_max, int pos0, int col0, float qk_scale, int gh, int rk_all,
               long long s_qb, long long s_kcb, long long s_kct, long long s_ksb, long long s_kst,
               long long s_alb, long long s_lb, long long s_lh) {
   __shared__ uint32_t qsm[MAXGH][REP][64];
@@ -85,11 +87,19 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
     }
     return;
   }
+#ifdef QPAIR
+  {                                              // q given as pair words [B, n_q, 64]: 16-byte copies
+    const uint4* src = reinterpret_cast<const uint4*>(q) + (long long)b * (s_qb / 8) + (long long)pg * gh * REP * 16;
+    uint4* dst = reinterpret_cast<uint4*>(&qsm[0][0][0]);
+    for (int i = tid; i < gh * REP * 16; i += 32 * NW) dst[i] = src[i];
+  }
+#else
   for (int i = tid; i < gh * REP * 64; i += 32 * NW) {
     const int gi = i >> 8, j = (i >> 6) & 3, pp = i & 63;
     const uint16_t* qh = q + b * s_qb + (long long)((pg * gh + gi) * REP + j) * HD;
     qsm[gi][j][pp] = (uint32_t)qh[pp] | ((uint32_t)qh[pp + 64] << 16);
   }
+#endif
 
   const bool vA = tA < T, vB = tB < T;
   // rank-1 A operand: alpha of the two tokens at k = 0 and k = 1 (lanes tq == 0); B carries kbar / ga
@@ -100,6 +110,14 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
   const float alAf = vA ? __uint_as_float((uint32_t)al[b * s_alb + tA] << 16) : 0.f;
   const float alBf = vB ? __uint_as_float((uint32_t)al[b * s_alb + tB] << 16) : 0.f;
 
+#ifdef COS_SMEM
+  __shared__ __align__(16) uint32_t csm[NW * 16][2][32];     // per token row: cos (32 words), sin (32 words), table order
+  for (int i = tid; i < NW * 16 * 16; i += 32 * NW) {        // 16 uint4 per row: 8 cos + 8 sin
+    const int r = i >> 4, k = i & 15, t = blockIdx.x * (16 * NW) + r;
+    const uint16_t* src = (k < 8 ? cosp : sinp) + (long long)(pos0 + (t < T ? t : 0)) * 64 + (k & 7) * 8;
+    reinterpret_cast<uint4*>(&csm[r][k >> 3][0])[k & 7] = *reinterpret_cast<const uint4*>(src);
+  }
+#else
   uint32_t cA[8], sA[8], cB[8], sB[8];
   {
     const uint4* pc = reinterpret_cast<const uint4*>(cosp + (long long)(pos0 + (vA ? tA : 0)) * 64 + tq * 16);
@@ -115,13 +133,55 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
     x = ps[0]; y = ps[1];
     sB[0] = x.x; sB[1] = x.y; sB[2] = x.z; sB[3] = x.w; sB[4] = y.x; sB[5] = y.y; sB[6] = y.z; sB[7] = y.w;
   }
+#endif
   const uint8_t* kcA = kc + b * s_kcb + (long long)(vA ? tA : 0) * s_kct + tq * 4;
   const uint8_t* kcB = kc + b * s_kcb + (long long)(vB ? tB : 0) * s_kct + tq * 4;
   const uint8_t* ksR = ks + b * s_ksb + (long long)((tq == 0 ? vA : vB) ? (tq == 0 ? tA : tB) : 0) * s_kst;
   const bool sOK = (tq == 0 && vA) || (tq == 1 && vB);
+#ifdef A_SMEM
+  // the tile's latent codes and scales, staged once (cp.async for the codes); the steps read them from
+  // shared memory. Rows padded by 16 bytes to spread the banks.
+  extern __shared__ __align__(16) uint8_t dsm[];
+  const int kstr = rk_all / 2 + 16, sstr = ((rk_all / 16 + 3) & ~3) + 4;
+  uint8_t* kcs = dsm;                                       // [NW * 16][kstr]
+  uint8_t* kss = dsm + NW * 16 * kstr;                      // [NW * 16][sstr]
+  {
+    const int t_base = blockIdx.x * (16 * NW);
+    const int cpr = rk_all / 32;                            // 16-byte chunks per row
+    for (int i = tid; i < NW * 16 * cpr; i += 32 * NW) {
+      const int r = i / cpr, o = (i - r * cpr) * 16;
+      const int t = t_base + r;
+      const uint8_t* src = kc + b * s_kcb + (long long)(t < T ? t : 0) * s_kct + o;
+      unsigned d = (unsigned)__cvta_generic_to_shared(kcs + r * kstr + o);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(t < T ? 16 : 0));
+    }
+    asm volatile("cp.async.commit_group;\n");
+    const int spr = rk_all / 32;                            // 2-byte scale pairs per row
+    for (int i = tid; i < NW * 16 * spr; i += 32 * NW) {
+      const int r = i / spr, o = (i - r * spr) * 2;
+      const int t = t_base + r;
+      *reinterpret_cast<uint16_t*>(kss + r * sstr + o) =
+          t < T ? *reinterpret_cast<const uint16_t*>(ks + b * s_ksb + (long long)t * s_kst + o) : (uint16_t)0;
+    }
+  }
+  const uint8_t* kcAs = kcs + (warp * 16 + g) * kstr + tq * 4;
+  const uint8_t* kcBs = kcs + (warp * 16 + g + 8) * kstr + tq * 4;
+  const uint8_t* ksRs = kss + (warp * 16 + g + (tq == 1 ? 8 : 0)) * sstr;
+#endif
   auto load_a = [&](int lat, int rk, int c, uint32_t* a, uint32_t& sa) {
     const int byte0 = (lat >> 1) + c * 32;
     const bool lo = c * 64 < rk, hi = c * 64 + 32 < rk;
+#ifdef A_SMEM
+    a[0] = lo ? *reinterpret_cast<const uint32_t*>(kcAs + byte0) : 0u;
+    a[1] = lo ? *reinterpret_cast<const uint32_t*>(kcBs + byte0) : 0u;
+    a[2] = hi ? *reinterpret_cast<const uint32_t*>(kcAs + byte0 + 16) : 0u;
+    a[3] = hi ? *reinterpret_cast<const uint32_t*>(kcBs + byte0 + 16) : 0u;
+    sa = 0u;
+    if (tq < 2 && lo) {
+      const uint16_t* p = reinterpret_cast<const uint16_t*>(ksRs + (lat >> 4) + c * 4);
+      sa = (uint32_t)p[0] | ((uint32_t)(hi ? p[1] : 0) << 16);
+    }
+#else
     a[0] = (vA && lo) ? *reinterpret_cast<const uint32_t*>(kcA + byte0) : 0u;
     a[1] = (vB && lo) ? *reinterpret_cast<const uint32_t*>(kcB + byte0) : 0u;
     a[2] = (vA && hi) ? *reinterpret_cast<const uint32_t*>(kcA + byte0 + 16) : 0u;
@@ -131,17 +191,26 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
       const uint16_t* p = reinterpret_cast<const uint16_t*>(ksR + (lat >> 4) + c * 4);
       sa = (uint32_t)p[0] | ((uint32_t)(hi ? p[1] : 0) << 16);
     }
+#endif
   };
+  // head parameters in shared memory
+  __shared__ int hsm[MAXGH][4];
+  __shared__ float hfm[MAXGH];
+  if (tid < gh * 4) hsm[tid >> 2][tid & 3] = head_i[(pg * gh) * 4 + tid];
+  if (tid < gh) hfm[tid] = head_f[pg * gh + tid];
 #ifdef PREFETCH
   uint32_t pa[4], psa;
   load_a(head_i[pg * gh * 4], head_i[pg * gh * 4 + 1], 0, pa, psa);
+#endif
+#ifdef A_SMEM
+  asm volatile("cp.async.wait_group 0;\n");
 #endif
   __syncthreads();
 
   for (int gi = 0; gi < gh; ++gi) {
     const int kvh = pg * gh + gi;
-    const int lat = head_i[kvh * 4], rk = head_i[kvh * 4 + 1];
-    const int fo = head_i[kvh * 4 + 2], so = head_i[kvh * 4 + 3];
+    const int lat = hsm[gi][0], rk = hsm[gi][1];
+    const int fo = hsm[gi][2], so = hsm[gi][3];
     float acc[NT][4];
 #ifdef RANK1
     {
@@ -149,7 +218,9 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
         acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+#ifndef SKIP_RANK1
         mma_bf16(acc[nt], ra0, ra1, 0u, 0u, tq == 0 ? __ldg(kw + nt * 8) : 0u, 0u);   // alpha * kbar / ga (hi + lo)
+#endif
       }
     }
 #else
@@ -182,6 +253,22 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
       // all 16 fragments in flight before the first MMA (not one load round trip per MMA)
       uint2 bb[NT];
       uint32_t sb[NT];
+#ifdef WIDEB
+      {                                            // 16-byte loads: fragment pairs, scale quads
+        const uint4* bw = reinterpret_cast<const uint4*>(afrag4) + fo / 2 + (long long)c * (NT / 2) * 32 + lane;
+        const uint4* sw = reinterpret_cast<const uint4*>(sfrag4) + so / 4 + (long long)c * (NT / 4) * 8 + g;
+#pragma unroll
+        for (int k = 0; k < NT / 2; ++k) {
+          const uint4 v = __ldg(bw + k * 32);
+          bb[2 * k] = make_uint2(v.x, v.y); bb[2 * k + 1] = make_uint2(v.z, v.w);
+        }
+#pragma unroll
+        for (int k = 0; k < NT / 4; ++k) {
+          const uint4 v = __ldg(sw + k * 8);
+          sb[4 * k] = v.x; sb[4 * k + 1] = v.y; sb[4 * k + 2] = v.z; sb[4 * k + 3] = v.w;
+        }
+      }
+#else
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
 #ifdef NO_BLOAD
@@ -190,6 +277,19 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
         bb[nt] = __ldg(bf2 + nt * 32); sb[nt] = __ldg(sf + nt * 8);
 #endif
       }
+#endif
+#ifdef BWAVE
+#pragma unroll
+      for (int w8 = 0; w8 < 2; ++w8) {
+        uint2 bw2[8];
+        uint32_t sw2[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { bw2[k] = __ldg(bf2 + (8 * w8 + k) * 32); sw2[k] = __ldg(sf + (8 * w8 + k) * 8); }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) mma_fp4(acc[8 * w8 + k], a0, a1, a2, a3, bw2[k].x, bw2[k].y, sa, sw2[k]);
+      }
+      if (false)
+#endif
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
 #ifdef NO_OMMA
@@ -202,7 +302,7 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
     }
     // scale by ga (so the rotated keys round to bf16 exactly as the reference's do), rotate each RoPE
     // pair, pack to bf16 and score against the REP query heads
-    const float ga = head_f[kvh];
+    const float ga = hfm[gi];
     const float2* kbf = kbar2 + (long long)kvh * 64 + tq * NT;
     float lo[4] = {0.f, 0.f, 0.f, 0.f};
 #ifdef NO_EPI
@@ -217,8 +317,16 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
         const int nt = 2 * kt + s;
         const uint32_t cw = nt & 1 ? 0xFFFF0000u : 0x0000FFFFu;
         const int sh = nt & 1 ? 0 : 16;
+#ifdef COS_SMEM
+        const int rA = warp * 16 + g, rB = rA + 8;
+        const uint32_t cwA = csm[rA][0][tq * 8 + kt], swA = csm[rA][1][tq * 8 + kt];
+        const uint32_t cwB = csm[rB][0][tq * 8 + kt], swB = csm[rB][1][tq * 8 + kt];
+        const float ca = __uint_as_float((cwA & cw) << sh), sa_ = __uint_as_float((swA & cw) << sh);
+        const float cb = __uint_as_float((cwB & cw) << sh), sb_ = __uint_as_float((swB & cw) << sh);
+#else
         const float ca = __uint_as_float((cA[kt] & cw) << sh), sa_ = __uint_as_float((sA[kt] & cw) << sh);
         const float cb = __uint_as_float((cB[kt] & cw) << sh), sb_ = __uint_as_float((sB[kt] & cw) << sh);
+#endif
 #ifdef RANK1
         const float x0A = acc[nt][0] * ga, x1A = acc[nt][1] * ga, x0B = acc[nt][2] * ga, x1B = acc[nt][3] * ga;
 #else
@@ -230,7 +338,12 @@ latent_logits(const uint16_t* __restrict__ q,        // [B, n_q, HD] bf16 (RoPE 
         ar[2 * s + 1] = pack_bf16(x0B * cb - x1B * sb_, x1B * cb + x0B * sb_);
       }
       const uint32_t b0 = g < REP ? qsm[gi][g][8 * kt + tq] : 0u, b1 = g < REP ? qsm[gi][g][8 * kt + 4 + tq] : 0u;
+#ifdef SKIP_LMMA
+      lo[0] += __uint_as_float(ar[0] ^ b0); lo[1] += __uint_as_float(ar[1] ^ b1);
+      lo[2] += __uint_as_float(ar[2] ^ b0); lo[3] += __uint_as_float(ar[3] ^ b1);
+#else
       mma_bf16(lo, ar[0], ar[1], ar[2], ar[3], b0, b1);
+#endif
     }
     const float sc = qk_scale;
     if (tq < 2) {                                // lo: (token tA, heads 2tq, 2tq + 1), (token tB, ...)

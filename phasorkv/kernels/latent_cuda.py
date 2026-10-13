@@ -162,6 +162,11 @@ def prepare3(pack):
     c["kbw3"] = (u16(hi) | (u16(lo) << 16)).contiguous()                              # [n_kv, NT * 8]
     c["sfrag3"] = torch.cat(sfr)
     c["head3"] = head.contiguous()
+    # WIDEB layouts: afrag [step][NT][32][2] -> [step][NT/2][32][4]; sfrag3 [step][NT][8] -> [step][NT/4][8][4]
+    af = c["afrag"].view(-1, NT // 2, 2, LANES, 2).permute(0, 1, 3, 2, 4).contiguous()
+    c["afrag4"] = af.flatten()
+    sf = c["sfrag3"].view(-1, NT // 4, 4, 8).permute(0, 1, 3, 2).contiguous()
+    c["sfrag4"] = sf.flatten()
     return c
 
 
@@ -198,11 +203,17 @@ def latent_logits3_cuda(pack, q, cache, seqlen, pos0, lg, col0, mx=None, gh=None
     kc, ks, al = cache["kc"], cache["ks"], cache["al"]
     i64 = lambda v: ("i64", int(v))
     null = torch.empty(0, dtype=torch.int32, device=q.device)
+    if "QPAIR" in defines:                           # pair words (q[p] | q[p + 64] << 16), [B, n_q, 64]
+        qu = q.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+        q = (qu[..., :64] | (qu[..., 64:] << 16)).contiguous()
+    smem = 0
+    if "A_SMEM" in defines:
+        smem = nw * 16 * (pack.rk // 2 + 16) + nw * 16 * (((pack.rk // 16 + 3) & ~3) + 4)
     module3(minb, rank1, prefetch, (*defines, f"NW={nw}")).launch("latent_logits", (n_t, B, pack.n_kv // gh), (32 * nw, 1, 1), [
-        q, kc, ks, al, seqlen, c["afrag"], c["sfrag3"], c["head3"], pack.head_f, c["kbw3"], c["kbar"], cos, sin, lg,
-        mx if mx is not None else ("i64", 0), T, pos0, col0, 1.0 / math.sqrt(pack.d), gh,
+        q, kc, ks, al, seqlen, c["afrag"], c["sfrag3"], c["afrag4"], c["sfrag4"], c["head3"], pack.head_f, c["kbw3"],
+        c["kbar"], cos, sin, lg, mx if mx is not None else ("i64", 0), T, pos0, col0, 1.0 / math.sqrt(pack.d), gh, pack.rk,
         i64(q.stride(0)), i64(kc.stride(0)), i64(kc.stride(1)), i64(ks.stride(0)), i64(ks.stride(1)),
-        i64(al.stride(0)), i64(lg.stride(0)), i64(lg.stride(1))])
+        i64(al.stride(0)), i64(lg.stride(0)), i64(lg.stride(1))], smem=smem)
 
 
 # ---- PV with the rest tier at 2 bits and the softmax fused (csrc/latent_pv2.cu) ---------------------
@@ -258,6 +269,33 @@ def latent_logits4_cuda(pack, q, cache, seqlen, pos0, lg, col0, mx=None, gh=None
     i64 = lambda v: ("i64", int(v))
     _MODS4[minb].launch("latent_logits", (n_t, B, pack.n_kv // gh), (128, 1, 1), [
         q, kc, ks, al, seqlen, c["afrag"], c["sfrag3"], c["head3"], pack.head_f, c["kbw3"], c["kbar"], cos, sin, lg,
+        mx if mx is not None else ("i64", 0), T, pos0, col0, 1.0 / math.sqrt(pack.d), gh,
+        i64(q.stride(0)), i64(kc.stride(0)), i64(kc.stride(1)), i64(ks.stride(0)), i64(ks.stride(1)),
+        i64(al.stride(0)), i64(lg.stride(0)), i64(lg.stride(1))])
+
+
+# ---- 32 tokens per warp (csrc/latent_logits5.cu) -------------------------------------------------------
+_SRC5 = os.path.join(os.path.dirname(__file__), "csrc", "latent_logits5.cu")
+_MODS5 = {}
+
+
+def latent_logits5_cuda(pack, q, cache, seqlen, pos0, lg, col0, mx=None, gh=None, minb=2, nw=4):
+    c = prepare3(pack)
+    B, T = q.shape[0], int(cache["kc"].shape[1])
+    n_t = math.ceil(T / (32 * nw))
+    if gh is None:
+        n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+        gh = min(pack.n_kv, 8)
+        while gh > 1 and B * n_t * (pack.n_kv // gh) < 2 * n_sm:
+            gh //= 2
+    key = (minb, nw)
+    if key not in _MODS5:
+        _MODS5[key] = CubinModule(_SRC5, flags=("-O3", "-std=c++17", f"-DMINB={minb}", f"-DNW={nw}"))
+    cos, sin = cos_sin(pack, pos0 + T)
+    kc, ks, al = cache["kc"], cache["ks"], cache["al"]
+    i64 = lambda v: ("i64", int(v))
+    _MODS5[key].launch("latent_logits", (n_t, B, pack.n_kv // gh), (32 * nw, 1, 1), [
+        q, kc, ks, al, seqlen, c["afrag"], c["sfrag3"], c["head3"], pack.head_f, c["kbw3"], cos, sin, lg,
         mx if mx is not None else ("i64", 0), T, pos0, col0, 1.0 / math.sqrt(pack.d), gh,
         i64(q.stride(0)), i64(kc.stride(0)), i64(kc.stride(1)), i64(ks.stride(0)), i64(ks.stride(1)),
         i64(al.stride(0)), i64(lg.stride(0)), i64(lg.stride(1))])
