@@ -246,6 +246,7 @@ class LatentPatch:
         self.wq = False                       # K rebuild weights in NVFP4 (native FP4 x FP4 matmul)
         self.keep_first = 0                   # first tokens kept exact in bf16 (KVTC / AATC's sink rule)
         self.dyn_sink = False                 # also keep exact every token detected as a sink (alpha < 0.5)
+        self.skip = set()                     # layers left exact (bf16); compression() charges them in full
         self.hi_kind = None                   # token hybrid: anchors use this tier kind, the rest self.kind
         self.anchor_frac = 0.0                #   share of each sequence's tokens that are anchors
         self.sal_mode = "sq"                  #   anchor choice: sq mean-query alignment, sa sink-ness (-alpha), sr random
@@ -278,6 +279,8 @@ class LatentPatch:
                     self.dyn_sink = True
                 if o.startswith("rw") and o[2:].isdigit():
                     self.keep_last = int(o[2:])
+                if o.startswith("sk") and o[2:].replace("_", "").isdigit():
+                    self.skip = {int(x) for x in o[2:].split("_")}
                 if o.startswith("hi") and o[2:].isdigit():
                     self.hi_kind = "t" + o[2:]
                     assert self.hi_kind in TIERED, self.hi_kind
@@ -379,6 +382,7 @@ class LatentPatch:
         assert self.kind in TIERED, "global allocation is implemented for the tiered kinds"
         drop = MENU_ALL.index("drop")
         kd, vd = self._tier_cost()
+        tables = {l: t for l, t in tables.items() if l not in self.skip}
         gk = next(iter(tables.values())).get("k_group", 1)
         overhead = sum(scale_overhead(self.kind, n_kv // gk))
         pos = [v for l in sens for v in (sens[l]["k"], sens[l]["v"]) if v > 0]
@@ -411,6 +415,8 @@ class LatentPatch:
 
     # -- installation ------------------------------------------------------
     def patch(self, i, layer, prep, n_kv, d, n_q, device):
+        if i in self.skip:
+            return lambda: None
         fK, fV = self.plan[i] if self.plan is not None else self._choose(prep, n_kv, d)
         attn = layer.self_attn
         per = d // UNIT
