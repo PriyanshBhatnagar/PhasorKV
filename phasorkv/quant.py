@@ -116,6 +116,14 @@ def block_quant(x: torch.Tensor, fmt: str, axis: int = -1, second=None) -> torch
     return q.movedim(-1, axis)
 
 
+def nv_static_second(var: torch.Tensor, fmt: str) -> torch.Tensor:
+    """Static fp32 per-tensor scale of an NV block format over a latent span of known per-channel
+    variance: 32 sigma of headroom over its widest channel. Fixed offline, as a cache that grows
+    token by token needs."""
+    vmax = ELEM[FORMATS[fmt][0]][1]
+    return (32 * var.max().clamp_min(1e-30).sqrt() / (448.0 * vmax)).reshape(1)
+
+
 def fp8_per_token(x: torch.Tensor) -> torch.Tensor:
     """E4M3 with one fp16 scale per vector along the last axis (8 + 16/len bits)."""
     s = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 448.0

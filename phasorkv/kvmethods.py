@@ -307,6 +307,8 @@ class LatentPatch:
         assert kind in MENUS, kind
         self.kind, self.frac, self.wV = kind, frac, wV
         self.layer_stats = {}
+        self.keep_meta = False                # keep, per layer, what the decode kernel packs (kmeta)
+        self.kmeta = {}
 
     @property
     def name(self):
@@ -488,7 +490,18 @@ class LatentPatch:
                 vk = (R * R) @ vk
                 if self.wq:
                     # the matmul k = A . codes reduces over the latent axis, so NVFP4 blocks of 16
-                    # run along it for the weights too (columns of A), one fp32 second scale per head
+                    # run along it for the weights too (columns of A), one fp32 second scale per head.
+                    # With .ex the latent's static per-tier second scales fold into A's columns first
+                    # (with .al no 16-block of A straddles two tiers): the kernel then feeds the raw
+                    # block-scaled codes to one FP4 MMA chain per head
+                    if self.exact_nv:
+                        sec = torch.ones(r, device=device)
+                        for lo, hi, f in ((0, no, TIERED[self.kind][0]), (no, r, TIERED[self.kind][1])):
+                            if hi > lo and f in quant.FORMATS:
+                                sec[lo:hi] = quant.nv_static_second(vk[lo:hi], f).to(device)
+                        Ak = Ak * sec
+                        if self.keep_meta:
+                            self.kmeta.setdefault(i, {}).setdefault("A_raw", []).append(Ak.cpu())
                     Ak = quant.block_quant(Ak, "nvfp4", -1)
                 head_ranges.append((sum(len(c) for c in B_rows), no, r))
             else:
@@ -555,6 +568,11 @@ class LatentPatch:
             attn._prune_window = self.window
             attn.forward = types.MethodType(windowed_prune_forward, attn)
 
+        if self.keep_meta:
+            self.kmeta.setdefault(i, {}).update(
+                head_ranges=head_ranges, k_group=gk, k_blocks=[h for h in range(nkb) if any(
+                    fK[h * per + j] != "drop" for j in range(per))], var_k=self._var_k.cpu(),
+                var_v=self._var_v.cpu(), v_no=v_no, rv=rv, tiers=TIERED.get(self.kind))
         bits_k = self._bits(k_fmt, len(head_ranges), "k", [r for _, _, r in head_ranges],
                             [no for _, no, _ in head_ranges])
         bits_v = self._bits(v_fmt, 1, "v", [rv])
@@ -699,7 +717,9 @@ class LatentPatch:
 
             ex = self.exact_nv
 
-            def qt(x, fmt, var):
+            fold = ex and self.wq
+
+            def qt(x, fmt, var, side="k"):
                 if fmt in ("s4", "s3", "s2"):
                     return static_quant(x, var, int(fmt[1]))
                 if fmt == "i2t":
@@ -710,8 +730,9 @@ class LatentPatch:
                 if ex:
                     # static per-tensor fp32 scale from the latent's known spread (32 sigma of
                     # headroom): fixed offline, as a cache that grows token by token needs
-                    vmax = quant.ELEM[quant.FORMATS[fmt][0]][1]
-                    second = (32 * var.max().clamp_min(1e-30).sqrt() / (448.0 * vmax)).reshape(1)
+                    second = quant.nv_static_second(var, fmt)
+                    if fold and side == "k":       # already folded into the rebuild weights A
+                        return quant.block_quant(x, fmt, -1, second) / second
                 return quant.block_quant(x, fmt, -1, second)
 
             def kq(c, lengths):
@@ -728,7 +749,7 @@ class LatentPatch:
                 out = torch.empty_like(c)
                 for lo, hi, f in ((0, v_no, vt), (v_no, rv, vr)):
                     if hi > lo:
-                        out[..., lo:hi] = qt(c[..., lo:hi], f, var_v[lo:hi])
+                        out[..., lo:hi] = qt(c[..., lo:hi], f, var_v[lo:hi], "v")
                 return out
             return kq, vq
         if kind == "palu":

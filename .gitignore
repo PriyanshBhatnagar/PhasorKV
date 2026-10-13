@@ -3,3 +3,4 @@ __pycache__/
 *.pt
 *.log
 .ipynb_checkpoints/
+phasorkv/kernels/csrc/build/
