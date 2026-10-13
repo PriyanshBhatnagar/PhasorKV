@@ -128,9 +128,11 @@ def static_quant(x, var, bits, widen=1.0):
     return (torch.floor(x / step) + 0.5).clamp(-L + 0.5, L - 0.5) * step
 
 
-def int2_per_token(x):
+def int2_per_token(x, bf16_scale=False):
     """2-bit symmetric, levels +-{0.5, 1.5} x (amax / 1.5), one scale per vector."""
     s = x.abs().amax(-1, keepdim=True).clamp_min(1e-5) / 1.5
+    if bf16_scale:
+        s = s.to(torch.bfloat16).float()
     return quant.round_to(x / s, "int2") * s
 
 
@@ -247,6 +249,9 @@ class LatentPatch:
         self.keep_first = 0                   # first tokens kept exact in bf16 (KVTC / AATC's sink rule)
         self.dyn_sink = False                 # also keep exact every token detected as a sink (alpha < 0.5)
         self.skip = set()                     # layers left exact (bf16); compression() charges them in full
+        self.exact_nv = False                 # .ex: kernel numerics (static fp32 per-tensor scale for NV
+                                              #   blocks, bf16 per-token scales)
+        self.unit2 = False                    # .u64: ranks in multiples of 64 dims (2 units), the FP4 MMA k
         self.hi_kind = None                   # token hybrid: anchors use this tier kind, the rest self.kind
         self.anchor_frac = 0.0                #   share of each sequence's tokens that are anchors
         self.sal_mode = "sq"                  #   anchor choice: sq mean-query alignment, sa sink-ness (-alpha), sr random
@@ -279,6 +284,10 @@ class LatentPatch:
                     self.dyn_sink = True
                 if o.startswith("rw") and o[2:].isdigit():
                     self.keep_last = int(o[2:])
+                if o == "ex":
+                    self.exact_nv = True
+                if o == "u64":
+                    self.unit2 = True
                 if o.startswith("sk") and o[2:].replace("_", "").isdigit():
                     self.skip = {int(x) for x in o[2:].split("_")}
                 if o.startswith("hi") and o[2:].isdigit():
@@ -352,9 +361,13 @@ class LatentPatch:
             # rank-only selections: keep each K block's (and V's) leading units
             per, nkb = gk * d // UNIT, n_kv // gk
             kept = [sum(f != "drop" for f in fK[h * per:(h + 1) * per]) for h in range(nkb)]
+            if self.unit2:
+                kept = [min(per, 2 * round(k / 2)) for k in kept]
             keep_f = menu[0]
             fK = [keep_f if j < kept[h] else "drop" for h in range(nkb) for j in range(per)]
             nv = sum(f != "drop" for f in fV)
+            if self.unit2:
+                nv = min(len(fV), 2 * round(nv / 2))
             fV = [keep_f if j < nv else "drop" for j in range(len(fV))]
         return fK, fV
 
@@ -407,6 +420,10 @@ class LatentPatch:
             else:
                 kept[l]["v"] += 1
         self.plan = {}
+        if self.unit2:
+            for l in kept:
+                kept[l]["k"] = [min(per, 2 * round(k / 2)) for k in kept[l]["k"]]
+                kept[l]["v"] = min(tables[l]["DV"].shape[0], 2 * round(kept[l]["v"] / 2))
         for l, tab in tables.items():
             fK = ["bf16" if j < kept[l]["k"][h] else "drop" for h in range(nkb) for j in range(per)]
             fV = ["bf16" if j < kept[l]["v"] else "drop" for j in range(tab["DV"].shape[0])]
@@ -680,14 +697,22 @@ class LatentPatch:
                     return token_scaled(_pads_to_zero(c, lengths), var_v, [(0, v_no, vt), (v_no, rv, vr)])
                 return kq, vq
 
+            ex = self.exact_nv
+
             def qt(x, fmt, var):
                 if fmt in ("s4", "s3", "s2"):
                     return static_quant(x, var, int(fmt[1]))
                 if fmt == "i2t":
-                    return int2_per_token(x)
+                    return int2_per_token(x, ex)
                 if fmt in ("i4t", "i3t"):
-                    return quant.int_sym_per_token(x, int(fmt[1]))
-                return quant.block_quant(x, fmt, -1)
+                    return quant.int_sym_per_token(x, int(fmt[1]), ex)
+                second = None
+                if ex:
+                    # static per-tensor fp32 scale from the latent's known spread (32 sigma of
+                    # headroom): fixed offline, as a cache that grows token by token needs
+                    vmax = quant.ELEM[quant.FORMATS[fmt][0]][1]
+                    second = (32 * var.max().clamp_min(1e-30).sqrt() / (448.0 * vmax)).reshape(1)
+                return quant.block_quant(x, fmt, -1, second)
 
             def kq(c, lengths):
                 c = _pads_to_zero(c, lengths)

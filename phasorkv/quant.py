@@ -136,10 +136,13 @@ def int_asym(x: torch.Tensor, nbits: int, group: int, axis: int) -> torch.Tensor
     return q.reshape(xt.shape)[..., :n].movedim(-1, axis)
 
 
-def int_sym_per_token(x: torch.Tensor, nbits: int) -> torch.Tensor:
-    """STAR-KV's quantizer: symmetric, one scale per vector (amax / qmax), clamp to the int range."""
+def int_sym_per_token(x: torch.Tensor, nbits: int, bf16_scale: bool = False) -> torch.Tensor:
+    """STAR-KV's quantizer: symmetric, one scale per vector (amax / qmax), clamp to the int range.
+    bf16_scale: the scale as a kernel stores it (bf16), not fp32."""
     qmax = 2 ** (nbits - 1) - 1
     s = x.abs().amax(-1, keepdim=True).clamp_min(1e-5) / qmax
+    if bf16_scale:
+        s = s.to(torch.bfloat16).float()
     return torch.round(x / s).clamp(-(2 ** (nbits - 1)), qmax) * s
 
 
