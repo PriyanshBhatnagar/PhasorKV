@@ -1,8 +1,8 @@
 """Per-layer latent shapes of a model-wide (.gs) tiered method, for the decode kernel benchmarks.
 
 From the unit tables (latent_<variant>/L{i}.pt) and the layer sensitivities, runs the same global
-allocation as run_quant.py and writes, per layer, the K latents (kv heads, rank) and the V rank.
-No model or GPU needed.
+allocation as run_quant.py and writes, per layer, the K latents (kv heads, rank), the V rank and
+its top-tier width. No model or GPU needed.
 
   python scripts/kernel_shapes.py --tag llama31_8b_inst --latent diagj-wo-alpha \
       --methods t32.gs.sink4.al.wq.ex@0.925 --n-kv 8 --d 128
@@ -15,7 +15,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from phasorkv.kvmethods import LatentPatch, UNIT
+from phasorkv.kvmethods import LatentPatch, UNIT, STARQ_OUT, kgrid_v_no
 
 
 def main():
@@ -52,8 +52,9 @@ def main():
                 continue
             fK, fV = plan[i]
             ranks = [UNIT * sum(f != "drop" for f in fK[h * per:(h + 1) * per]) for h in range(nkb)]
+            rv = UNIT * sum(f != "drop" for f in fV)
             layers[i] = dict(k_blocks=[[list(range(h * gk, (h + 1) * gk)), r] for h, r in enumerate(ranks)],
-                             rv=UNIT * sum(f != "drop" for f in fV))
+                             rv=rv, v_no=kgrid_v_no(rv) if pch.kg_v else int(STARQ_OUT * rv))
         out[f"{args.latent}/{m}"] = dict(k_group=gk, layers=layers)
         rk = sum(sum(r for _, r in l["k_blocks"]) for l in layers.values() if l) / n_layers
         rv = sum(l["rv"] for l in layers.values() if l) / n_layers

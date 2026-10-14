@@ -169,6 +169,15 @@ def starq_blocks(r, gen, no=None):
     return T.T, no          # latent' = T^T latent (VS <- T^T VS, U <- U T)
 
 
+def kgrid_v_no(rv):
+    """V top-tier width on the kernel grid (.kgv): the multiple of 32 nearest STARQ_OUT * rv that is
+    congruent to rv mod 64 and leaves both tiers non-empty. The q2 V row (top tier as nibbles, rest
+    as 2-bit codes in byte tiles of 32 columns) is then a whole number of 16-byte chunks, with no
+    padding. Ranks too small for one (rv <= 64) keep int(STARQ_OUT * rv)."""
+    c = [n for n in range(rv % 64, rv, 64) if n > 0]
+    return min(c, key=lambda n: abs(n - STARQ_OUT * rv)) if c else int(STARQ_OUT * rv)
+
+
 def group_blocks(r, g, gen):
     """Like starq_blocks, but one random-sign Hadamard per scale group of g consecutive
     dims inside each tier (aligned with the block-g scales of NV formats); a trailing
@@ -252,6 +261,12 @@ class LatentPatch:
         self.exact_nv = False                 # .ex: kernel numerics (static fp32 per-tensor scale for NV
                                               #   blocks, bf16 per-token scales)
         self.unit2 = False                    # .u64: ranks in multiples of 64 dims (2 units), the FP4 MMA k
+        self.kg_k = False                     # .kgk: K block ranks in multiples of 64 (the FP4 MMA k; allocated
+                                              #   in 64-dim chunks). For joint K (1-2% faster decode, same PPL);
+                                              #   per head it leaves only 0 / 64 / 128 (+0.5 C4 PPL at 90%)
+        self.kg_v = False                     # .kgv: V top tier a multiple of 32, = rv mod 64 (a q2 V row of
+                                              #   whole 2-bit byte tiles, no padding). .kg: both. Under 1%
+                                              #   faster, +0.01-0.05 PPL: not used
         self.hi_kind = None                   # token hybrid: anchors use this tier kind, the rest self.kind
         self.anchor_frac = 0.0                #   share of each sequence's tokens that are anchors
         self.sal_mode = "sq"                  #   anchor choice: sq mean-query alignment, sa sink-ness (-alpha), sr random
@@ -288,6 +303,10 @@ class LatentPatch:
                     self.exact_nv = True
                 if o == "u64":
                     self.unit2 = True
+                if o in ("kg", "kgk"):
+                    self.kg_k = True
+                if o in ("kg", "kgv"):
+                    self.kg_v = True
                 if o.startswith("sk") and o[2:].replace("_", "").isdigit():
                     self.skip = {int(x) for x in o[2:].split("_")}
                 if o.startswith("hi") and o[2:].isdigit():
@@ -363,7 +382,7 @@ class LatentPatch:
             # rank-only selections: keep each K block's (and V's) leading units
             per, nkb = gk * d // UNIT, n_kv // gk
             kept = [sum(f != "drop" for f in fK[h * per:(h + 1) * per]) for h in range(nkb)]
-            if self.unit2:
+            if self.unit2 or self.kg_k:
                 kept = [min(per, 2 * round(k / 2)) for k in kept]
             keep_f = menu[0]
             fK = [keep_f if j < kept[h] else "drop" for h in range(nkb) for j in range(per)]
@@ -406,9 +425,11 @@ class LatentPatch:
         for l, tab in tables.items():
             for side, D, c in (("k", tab["DK"], kd), ("v", tab["DV"], vd)):
                 e = D[:, drop].double()
+                g = 2 if side == "k" and self.kg_k else 1           # .kgk: K in 64-dim chunks (2 units)
+                e = e.reshape(-1, g).sum(1)
                 vals.append(max(sens[l][side], floor) * e)
-                costs.append(torch.full_like(e, c * UNIT))
-                owner += [(l, side, u) for u in range(len(e))]
+                costs.append(torch.full_like(e, c * UNIT * g))
+                owner += [(l, side, g * u, g) for u in range(len(e))]
             budget += (1 - self.frac) * 16 * 2 * n_kv * d - overhead
         vals, costs = torch.cat(vals), torch.cat(costs)
         order = torch.argsort(vals / costs, descending=True)
@@ -416,11 +437,11 @@ class LatentPatch:
         per, nkb = gk * d // UNIT, n_kv // gk
         kept = {l: {"k": [0] * nkb, "v": 0} for l in tables}
         for idx in keep:
-            l, side, u = owner[idx]
+            l, side, u, g = owner[idx]
             if side == "k":
-                kept[l]["k"][u // per] += 1
+                kept[l]["k"][u // per] += g
             else:
-                kept[l]["v"] += 1
+                kept[l]["v"] += g
         self.plan = {}
         if self.unit2:
             for l in kept:
@@ -533,10 +554,11 @@ class LatentPatch:
         if self.kind in TIER_H or getattr(self, "dq_rot", "") == "tierH":
             gv = torch.Generator().manual_seed(1234)
             if self.krot == "tier":                      # V rotation follows the K choice
-                R, v_no = starq_blocks(rv, gv)
+                R, v_no = starq_blocks(rv, gv, kgrid_v_no(rv) if self.kg_v else None)
             elif self.krot == "none":
-                R, v_no = torch.eye(rv, dtype=torch.float64), int(STARQ_OUT * rv)
+                R, v_no = torch.eye(rv, dtype=torch.float64), kgrid_v_no(rv) if self.kg_v else int(STARQ_OUT * rv)
             else:
+                assert not self.kg_v, ".kgv sets the V tiers itself"
                 R, v_no = group_blocks(rv, self.krot, gv)
             R = R.float().to(device)
             Bv, Av = R @ Bv, Av @ R.T
@@ -575,7 +597,7 @@ class LatentPatch:
                 var_v=self._var_v.cpu(), v_no=v_no, rv=rv, tiers=TIERED.get(self.kind))
         bits_k = self._bits(k_fmt, len(head_ranges), "k", [r for _, _, r in head_ranges],
                             [no for _, no, _ in head_ranges])
-        bits_v = self._bits(v_fmt, 1, "v", [rv])
+        bits_v = self._bits(v_fmt, 1, "v", [rv], [v_no] if self.kg_v else None)
         self.layer_stats[i] = dict(bits_k=bits_k, bits_v=bits_v, rank_k=Bk_all.shape[0], rank_v=rv,
                                    k_rebuild_flops=sum(2 * dk * r for _, _, r in head_ranges),
                                    rotated_k=sum(f.endswith("|H") for f in fK),

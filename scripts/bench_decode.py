@@ -136,7 +136,7 @@ def main():
     for name in names:
         layers = shapes[name]["layers"]
         packs = [la.synthetic_pack(N_Q, N_KV, D_HEAD, D_MODEL, [(h, r) for h, r in l["k_blocks"]], l["rv"],
-                                   device=dev, seed=i)
+                                   device=dev, seed=i, v_no=l.get("v_no"))
                  for i, l in sorted(((int(i), l) for i, l in layers.items() if l))]
         bpt = sum(p.bytes_per_token("q2") for p in packs)
         bpt_packed = sum(p.bytes_per_token_packed() for p in packs)

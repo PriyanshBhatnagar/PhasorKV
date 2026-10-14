@@ -169,9 +169,10 @@ def pack_from_patch(patch, i, attn, n_q, rotary, device="cuda"):
 
 
 def synthetic_pack(n_q, n_kv, d, D, k_blocks, rv, tiers=("nvint3", "nvint2", "i3t", "i2t"),
-                   rope_theta=500000.0, device="cuda", seed=0):
+                   rope_theta=500000.0, device="cuda", seed=0, v_no=None):
     """A LayerPack with random factors and the given shapes, for tests and benchmarks.
-    k_blocks: [(kv heads, rank)], e.g. per-head [([h], r_h) for h] or joint [(range(n_kv), r)]."""
+    k_blocks: [(kv heads, rank)], e.g. per-head [([h], r_h) for h] or joint [(range(n_kv), r)];
+    v_no: V top-tier width (default int(0.2 rv))."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     rn = lambda *s: torch.randn(*s, generator=gen)
     kt, kr, vt, vr = tiers
@@ -191,7 +192,7 @@ def synthetic_pack(n_q, n_kv, d, D, k_blocks, rv, tiers=("nvint3", "nvint2", "i3
     for heads, o, r, _ in blocks:
         B_k[o:o + r] = rn(r, D) / math.sqrt(D) * torch.exp(-torch.arange(r) / max(r, 1) * 2.0)[:, None]
     inv = 1.0 / rope_theta ** (torch.arange(0, d, 2).float() / d)
-    return LayerPack(n_q=n_q, n_kv=n_kv, d=d, rk=rk, rv=rv, v_no=int(0.2 * rv),
+    return LayerPack(n_q=n_q, n_kv=n_kv, d=d, rk=rk, rv=rv, v_no=int(0.2 * rv) if v_no is None else v_no,
                      v_bits=(int(vt[1]), int(vr[1])), head_i=head_i, head_f=head_f,
                      a_codes=a_codes, a_scales=a_scales,
                      kbar=(rn(n_kv * d) * 0.5).to(device), vbar=(rn(n_kv * d) * 0.1).to(device),
