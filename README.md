@@ -450,3 +450,30 @@ What the native constraints cost:
 - **In total:** about 1-2% PPL and 0.1-1.2 task points against the best software formats. That is within the go/no-go threshold.
 
 Reproduce: `bash scripts/sweep_native.sh <model> <tag> <device>`.
+
+### Rank granularity for the decode kernels (`.kgk`, `.kgv`)
+
+The kernels have their own grid:
+- **Logits kernel:** walks each K block's latent in FP4 MMA steps of k = 64, so a rank of 64n + 32 pays for n + 1 full steps. Ranks must also be multiples of 32, because the cache rows are staged in 16-byte copies.
+- **PV kernel:** reads the V top tier in 16-column tiles and the 2-bit rest tier in 32-column tiles, then pads each row to 16 bytes.
+
+One layer on the RTX 5090, 16K tokens x 8 sequences (`rank_sweep_K.json`, `rank_sweep_V.json` in `results/rtx5090`):
+- **Joint K:** logits time steps every 64 ranks, about +20 us per step. Rank 160 costs the same as 192, and 224 the same as 256.
+- **Per-head K:** rank 96 on every head takes 112.9 us. Half the heads at 64 and half at 128, with the same bytes, takes 104.2 us.
+- **V:** a top tier that is a multiple of 32 and congruent to rv mod 64 leaves rows unpadded. That makes PV 0-3% faster at most ranks, and up to 12% faster at a few.
+
+All 32 layers on the RTX 5090. Changes are against 32-dim ranks and an `int(0.2 rv)` V top tier, run on the same GPU:
+
+| config | WikiText-2 / C4 PPL | 6-task avg | decode speed |
+|---|---|---|---|
+| joint 90%, `.kgk` (K block ranks in 64s) | 8.183 / 13.255 (from 8.180 / 13.227) | 65.53 (from 65.27) | +1.0-1.6% |
+| joint 92.5%, `.kgk` | 8.399 / 14.171 (from 8.381 / 14.191) | 65.02 (from 65.15) | +1.0-1.8% |
+| per-head 90%, `.kgk` | 8.608 / 14.618 (from 8.460 / 14.116) | - | +2.7-4.3% (`.kg`) |
+| `.kgv` (aligned V top tier), any config | +0.01-0.05 / +0.02-0.19 | - | under 1% |
+
+Which to use:
+- **Joint K:** use `.kgk`. It is faster at no cost in accuracy.
+- **Per-head K:** stay in 32s. A 128-dim head with 64-dim steps can only take 0, 64 or 128, which costs 0.5 C4 PPL at 90%.
+- **V:** keep `int(0.2 rv)`. The aligned top tier only saves bytes by dropping 3-bit columns.
+
+Reproduce: `python scripts/kernel_shapes.py --tag <tag> --latent diagj-wo-alpha --methods t32.gs.sink4.al.wq.ex.kgk@0.925`, then `python scripts/bench_decode.py --tag <tag> --configs <keys>`.
