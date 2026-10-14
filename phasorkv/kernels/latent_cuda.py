@@ -218,10 +218,12 @@ def latent_logits3_cuda(pack, q, cache, seqlen, pos0, lg, col0, mx=None, gh=None
 
 # ---- PV with the rest tier at 2 bits and the softmax fused (csrc/latent_pv2.cu) ---------------------
 _SRC_PV2 = os.path.join(os.path.dirname(__file__), "csrc", "latent_pv2.cu")
+PV2_DEFINES = ["ACC16"]   # f16-accumulate MMA per 16-token step (2x the rate of fp32 accumulation on GeForce); [] for fp32
 _MOD_PV2 = {}
 
 
 def latent_pv2_cuda(pack, lg, cache, seqlen, col0, mx, z, beta, lsum, n_seg=None, bt=64, nstage=2, defines=(), ng=1):
+    defines = tuple(defines) + tuple(PV2_DEFINES)
     """z: [B, n_q, zw] or [B, ncopy, n_q, zw] (segments spread over the copies; the caller sums them)."""
     """z [B, 32, pack.q2_zw] += exp(lg - max) . V (q2 cache), beta, lsum likewise."""
     B, T = lg.shape[0], int(cache["vc"].shape[1])

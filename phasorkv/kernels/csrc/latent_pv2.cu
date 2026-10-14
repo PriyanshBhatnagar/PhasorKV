@@ -30,6 +30,19 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pr
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(pred ? 16 : 0));
 }
 __device__ __forceinline__ void mma_f16(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef ACC16
+  // GeForce Blackwell runs f16 MMA with an f16 accumulator at twice the rate of fp32 accumulation
+  // (measured on the RTX 5090: 15.4 vs 30.8 clocks per m16n8k16): sum this k16 step (16 tokens) in
+  // f16 from zero, then add it into the fp32 accumulator. The V operand carries 1/16 of its tier
+  // scale (exact) and the sum is scaled back here, so 16 products of p <= 1 and |v| <= 6 s cannot
+  // overflow f16 below s ~ 10^4.
+  uint32_t h0, h1;
+  asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
+      : "=r"(h0), "=r"(h1) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0u));
+  const float2 f0 = __half22float2(*reinterpret_cast<__half2*>(&h0)), f1 = __half22float2(*reinterpret_cast<__half2*>(&h1));
+  d[0] = fmaf(f0.x, 16.f, d[0]); d[1] = fmaf(f0.y, 16.f, d[1]); d[2] = fmaf(f1.x, 16.f, d[2]); d[3] = fmaf(f1.y, 16.f, d[3]);
+  return;
+#endif
 #ifdef NO_MMA
   d[0] += __uint_as_float(a[0] ^ b0); d[1] += __uint_as_float(a[1] ^ b1);
   return;
@@ -178,8 +191,13 @@ latent_pv2(const float* __restrict__ lgt,       // [B, NQ, W] logits; latent tok
         a[m][3] = pp(h + 8, ks + 2 * tq + 8);
       }
       const uint32_t s0 = sr[ks + 2 * tq], s1 = sr[ks + 2 * tq + 1], s8 = sr[ks + 2 * tq + 8], s9 = sr[ks + 2 * tq + 9];
-      auto h2 = [](uint32_t u, uint32_t v) {
-        __half2 r = __floats2half2_rn(__uint_as_float(u << 16), __uint_as_float(v << 16));
+      auto h2 = [](uint32_t u, uint32_t v) {     // bf16 tier scales -> f16 pair (ACC16: / 16 for f16-sum headroom)
+#ifdef ACC16
+        constexpr float k = 1.f / 16;
+#else
+        constexpr float k = 1.f;
+#endif
+        __half2 r = __floats2half2_rn(__uint_as_float(u << 16) * k, __uint_as_float(v << 16) * k);
         return *reinterpret_cast<uint32_t*>(&r);
       };
       const uint8_t* vr = vraw + (st * BT + ks) * vstr;
